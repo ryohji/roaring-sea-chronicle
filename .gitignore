@@ -1,0 +1,15 @@
+# ビルド生成物。ROM はコミットしない（CLAUDE.md 第6条）。
+build/
+*.nes
+*.o
+*.map
+*.labels
+*.chr
+
+# エミュレータ
+*.sav
+*.savestate
+
+# Python
+__pycache__/
+*.pyc
