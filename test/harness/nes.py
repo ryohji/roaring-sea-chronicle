@@ -100,6 +100,17 @@ class Ppu:
 
 
 class Mmc3:
+    """MMC3。PRG-RAM ($6000-$7FFF) は ADR-0001（案A）のセーブ領域なので、
+    $A001 の有効ビット(bit7)と書込禁止ビット(bit6)を両方再現する。
+
+    無効のまま $6000-$7FFF を読むと実機は開放バスを返す。ここでは近似として
+    OPEN_BUS($FF) を返す（実機の値は直前にバスに乗っていた値で不定）。
+    無効／書込禁止のときの書き込みは捨てる。「有効化を忘れたのにセーブできている」
+    という偽の合格を出さないための再現である。
+    """
+
+    OPEN_BUS = 0xFF
+
     def __init__(self, rom):
         self.rom = rom
         self.prg_bank_count = len(rom.prg) // 8192
@@ -109,7 +120,12 @@ class Mmc3:
         self.irq_latch = 0
         self.irq_enabled = False
         self.prg_ram = bytearray(0x2000)
-        self.prg_ram_enabled = False
+        self.prg_ram_enabled = False            # $A001 bit7
+        self.prg_ram_write_protected = False    # $A001 bit6（1 = 書き込み禁止）
+        self.prg_ram_reg = None                 # $A001 に最後に書かれた値（None = 未書き込み）
+        self.prg_ram_reg_writes = 0
+        self.prg_ram_writes_denied = 0          # 無効／書込禁止のまま捨てた書き込みの回数
+        self.prg_ram_reads_disabled = 0         # 無効のまま読んだ回数（開放バスを返した）
 
     def prg_offset(self, addr):
         slot = (addr - 0x8000) // 0x2000
@@ -123,11 +139,17 @@ class Mmc3:
 
     def read(self, addr):
         if 0x6000 <= addr < 0x8000:
+            if not self.prg_ram_enabled:
+                self.prg_ram_reads_disabled += 1
+                return self.OPEN_BUS
             return self.prg_ram[addr - 0x6000]
         return self.rom.prg[self.prg_offset(addr)]
 
     def write(self, addr, value):
         if 0x6000 <= addr < 0x8000:
+            if not self.prg_ram_enabled or self.prg_ram_write_protected:
+                self.prg_ram_writes_denied += 1
+                return
             self.prg_ram[addr - 0x6000] = value
             return
         even = (addr & 1) == 0
@@ -140,7 +162,10 @@ class Mmc3:
             if even:
                 self.mirroring = value & 1
             else:
+                self.prg_ram_reg = value
+                self.prg_ram_reg_writes += 1
                 self.prg_ram_enabled = bool(value & 0x80)
+                self.prg_ram_write_protected = bool(value & 0x40)
         elif addr < 0xE000:
             if even:
                 self.irq_latch = value
@@ -149,13 +174,31 @@ class Mmc3:
 
 
 class Nes:
-    def __init__(self, rom_path):
+    def __init__(self, rom_path, prg_ram_fill=0x00):
+        """prg_ram_fill: 電源投入時の PRG-RAM の中身（1バイト or bytes）。
+
+        本作の PRG-RAM は電池でバックアップされる（ADR-0001 案A）ので、
+        電源投入時の内容は「前回の電源断の瞬間のまま」または電池切れ後の不定値である。
+        起動時にゼロだと決めつけた検証をしないよう、埋め値を差し替えられるようにしてある。
+        """
         self.rom = Rom(rom_path)
         if self.rom.mapper != 4:
             raise ValueError("このハーネスは MMC3 (mapper 4) 専用。ROM は mapper %d" % self.rom.mapper)
+        self.prg_ram_fill = prg_ram_fill
+        self._power_on_state(None)
+
+    def _power_on_state(self, prg_ram):
+        """電源投入直後の状態を作る。prg_ram が bytes ならその内容を引き継ぐ。"""
         self.ram = bytearray(0x800)
         self.ppu = Ppu()
         self.mapper = Mmc3(self.rom)
+        if prg_ram is not None:
+            self.mapper.prg_ram[:] = prg_ram
+        elif isinstance(self.prg_ram_fill, int):
+            if self.prg_ram_fill:
+                self.mapper.prg_ram[:] = bytes([self.prg_ram_fill]) * len(self.mapper.prg_ram)
+        else:
+            self.mapper.prg_ram[:] = self.prg_ram_fill
         self.cpu = Cpu(self)
         self.pad = 0
         self.pad_shift = 0
@@ -163,6 +206,22 @@ class Nes:
         self.dma_count = 0
         self.frame = 0
         self.oam_dma_page = None
+
+    def snapshot_prg_ram(self):
+        """セーブ領域 ($6000-$7FFF) の内容を取り出す（バスを経由しない検査用）。"""
+        return bytes(self.mapper.prg_ram)
+
+    def power_cycle(self, keep_prg_ram=True):
+        """電源を入れ直す。CPU/RAM/PPU/マッパーは初期状態に戻し、
+        電池でバックアップされる PRG-RAM だけ内容を引き継ぐ（keep_prg_ram=False で電池切れ）。
+
+        P4 で campaign-dev がセーブを実装したら、
+        「オートセーブ → power_cycle() → 再開で状態が一致する」
+        「チェックサム破損 → 新規ゲーム扱い」の検証にこれを使う（ADR-0001 帰結節）。
+        """
+        saved = bytes(self.mapper.prg_ram) if keep_prg_ram else None
+        self._power_on_state(saved)
+        self.cpu.reset()
 
     # ---- バス ----
     def read(self, addr):

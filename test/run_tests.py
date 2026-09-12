@@ -21,10 +21,17 @@ from nes import Nes, Rom, load_labels   # noqa: E402
 from routes import parse_route, play, RouteError   # noqa: E402
 
 
+ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途のオートセーブ）"
+
+
 class Results:
     def __init__(self):
         self.passed = 0
         self.failed = []
+
+    def section(self, title):
+        """テストが増えても読めるように、層の中を小見出しで区切る。"""
+        print("  -- %s" % title)
 
     def check(self, name, ok, detail=""):
         if ok:
@@ -45,6 +52,7 @@ def layer1_structure(rom_path, labels, r):
         r.check("ROM を読める", False, str(e))
         return None
 
+    r.section("ROM 構成とベクタ")
     r.check("iNES ヘッダのマッパー番号が 4 (MMC3)", rom.mapper == 4,
             "mapper=%d。cfg/mmc3.cfg と src/header.s の不整合を疑え" % rom.mapper)
     r.check("PRG-ROM が 256KB (8KB × 32 バンク)", len(rom.prg) == 256 * 1024,
@@ -75,7 +83,44 @@ def layer1_structure(rom_path, labels, r):
 
     r.check("CHR の先頭ページにタイルが入っている", any(rom.chr[:0x1000]),
             "CHR 先頭 4KB が全て 0。chr/*.png の変換に失敗している可能性がある")
+
+    layer1_save_header(rom, r)
     return rom
+
+
+def layer1_save_header(rom, r):
+    """セーブ方式（ADR-0001 案A）が ROM ヘッダから消えていないことの検証。
+
+    ここで検証する3点が崩れても ROM は「NES の ROM として valid」なままなので、
+    実行検証では捕まらない。構造検証でしか気付けない。
+    """
+    r.section("セーブ領域 / %s" % ADR1)
+
+    flags6, flags7, flags8 = rom.header[6], rom.header[7], rom.header[8]
+
+    r.check("flags6 bit1 = バッテリーバックアップ有り", rom.has_battery,
+            "flags6=$%02X（bit1=0）。電池なしの ROM と宣言している。"
+            "この宣言が無いとエミュレータは .sav を作らず、実機カートでも $6000-$7FFF は "
+            "電源断で揮発する。つまり**オートセーブしたはずのデータが電源を切るたびに全部消える**。"
+            "%s により flags6 は $43（bit1=1）。src/header.s を見よ" % (flags6, ADR1))
+
+    ines2 = (flags7 & 0x0C) == 0x08
+    r.check("flags7 が iNES 1.0 を示す (bit3-2 = 00)", not ines2,
+            "flags7=$%02X（bit3-2=%%10 = NES 2.0）。NES 2.0 ではバイト8は PRG-RAM サイズではなく "
+            "マッパー番号の上位/サブマッパーとして読まれるため、flags8=$01 が "
+            "「PRG-RAM 8KB」の意味を失い（マッパー番号も 4 から化ける）、"
+            "**セーブ領域が確保されずセーブが消える**。"
+            "NES 2.0 に移行するなら flags10 の PRG-RAM シフト値を別途宣言すること" % flags7)
+
+    r.check("flags8 が PRG-RAM 8KB を宣言している (=1)", flags8 == 1,
+            "flags8=$%02X（期待 $01 = 8KB）。0 でも 8KB 扱いする実装が多いが、"
+            "「PRG-RAM 無し」と解釈するエミュレータ／フラッシュカートでは $6000-$7FFF が "
+            "存在しないことになり、**セーブしたはずのデータが次回起動時に丸ごと無い**。"
+            "電池付き ROM では容量を明示する。src/header.s のバイト8 を $01 に" % flags8)
+
+    r.check("トレーナ無し (flags6 bit2 = 0)", not rom.has_trainer,
+            "flags6=$%02X（bit2=1）。トレーナ 512 バイトが挟まると PRG の読み出し位置が "
+            "ずれ、バッテリー領域を含むヘッダ解釈が全部狂う" % flags6)
 
 
 # ---------------------------------------------------------------- L2
@@ -89,6 +134,7 @@ def layer2_execution(rom_path, labels, r):
     except CpuCrash as e:
         r.check("リセットから10フレーム走る", False, str(e))
         return
+    r.section("起動・描画・入力")
     r.check("リセットから10フレーム、クラッシュせずに走る", True)
 
     r.check("NMI が有効になっている", nes.ppu.nmi_enabled,
@@ -170,12 +216,95 @@ def layer2_execution(rom_path, labels, r):
         r.check("経路ファイルを再生できる", False, str(e))
 
     # 長時間の安定性（スタック破壊や暴走の検出）
+    crash = None
     try:
         nes.run_frames(120)
     except CpuCrash as e:
-        r.check("2秒ぶん（120フレーム）走り続ける", False, str(e))
+        crash = e
+    r.check("2秒ぶん（120フレーム）走り続ける", crash is None, str(crash))
+    if crash is not None:
         return
-    r.check("2秒ぶん（120フレーム）走り続ける", True)
+
+    # セーブ領域は 120 フレーム走り切った後の状態で見る。
+    # 「起動時に有効化したが、走っているうちに誰かが $A001 を潰した」も捕まえたいため。
+    layer2_save_ram(nes, r)
+
+
+def layer2_save_ram(nes, r):
+    """セーブ領域 ($6000-$7FFF) が使える状態になっていることの実行検証。
+
+    ROM ヘッダ（L1）が電池を宣言していても、MMC3 の $A001 で有効化しなければ
+    $6000-$7FFF は開放バスのままで、書いたセーブは1バイトも残らない。
+    """
+    r.section("セーブ領域 / %s" % ADR1)
+    m = nes.mapper
+
+    if not r.check("mmc3_init が $A001 (PRG-RAM 制御) に書き込んでいる", m.prg_ram_reg is not None,
+                   "リセットから130フレーム走って $A001 に一度も書いていない。"
+                   "MMC3 の PRG-RAM は電源投入時は無効なので、$6000-$7FFF は開放バスのまま＝"
+                   "**オートセーブが1バイトも保存されない**。"
+                   "src/engine/bank.s の mmc3_init にある "
+                   "`lda #MMC3_PRGRAM_RW / sta MMC3_PRG_RAM` が消えている"):
+        return
+
+    r.check("$A001 の最終値が $80（PRG-RAM 有効・書込可）", m.prg_ram_reg == 0x80,
+            "$A001=$%02X（bit7 有効=%d / bit6 書込禁止=%d、$A001 への書き込みは %d 回）。"
+            "bit7=0 ならセーブ領域が見えず、bit6=1 なら読めても書けない。"
+            "どちらも**オートセーブが保存されない**。期待は MMC3_PRGRAM_RW = $80"
+            % (m.prg_ram_reg, 1 if m.prg_ram_enabled else 0,
+               1 if m.prg_ram_write_protected else 0, m.prg_ram_reg_writes))
+
+    # CPU バス経由の往復。ハーネスの配列を直接叩かないこと（バス配線の誤りを捕まえる）。
+    probes = [(0x6000, 0x5A), (0x6123, 0xC3), (0x7000, 0x01), (0x7FFF, 0xA5)]
+    saved_ram = bytes(nes.ram)
+    originals = [(a, nes.read(a)) for a, _ in probes]
+    for addr, value in probes:
+        nes.write(addr, value)
+    bad = ["$%04X: 書いた $%02X / 読めた $%02X" % (a, v, nes.read(a))
+           for a, v in probes if nes.read(a) != v]
+    r.check("$6000-$7FFF が CPU バス経由で読み書きできる", not bad,
+            "%s。セーブ領域がバスに繋がっていない（$A001 の有効化漏れ、"
+            "cfg/mmc3.cfg の PRGRAM 領域の消失、ハーネスのバス配線の誤りのいずれか）。"
+            "**セーブを書いても読み戻せない**。捨てられた書き込み %d 回 / "
+            "無効のまま読んだ回数 %d 回"
+            % ("、".join(bad), m.prg_ram_writes_denied, m.prg_ram_reads_disabled))
+
+    r.check("$6000-$7FFF が CPU RAM ($0000-$07FF) にエイリアスしていない",
+            bytes(nes.ram) == saved_ram,
+            "セーブ領域に書いたら内部 RAM も変わった。アドレスデコードが誤っており、"
+            "セーブのたびにゲーム状態が壊れる（逆に RAM の更新でセーブが壊れる）")
+
+    for addr, value in originals:                 # 後続の検証のため元に戻す
+        nes.write(addr, value)
+
+    # 電池バックアップの意味づけ: 電源を入れ直しても $6000-$7FFF の内容は残る。
+    # 起動処理が RAM クリアのついでにここまで消すと、セーブが起動のたびに失われる。
+    residual = bytes((i * 7 + 0x5A) & 0xFF for i in range(0x2000))
+    nes.mapper.prg_ram[:] = residual              # 前回の電源断時点の内容を模す
+    nes.power_cycle()                             # 電池で保持されるのは PRG-RAM だけ
+    try:
+        nes.run_frames(10)
+    except CpuCrash as e:
+        r.check("電池に残ったデータがあっても起動する", False,
+                "$6000-$7FFF に前回のセーブが残った状態で起動したらクラッシュした: %s。"
+                "起動処理が PRG-RAM の内容を「未初期化（ゼロ）」と決めつけている疑い。"
+                "電池付きなので電源投入時の内容は前回のまま、電池切れなら不定値である" % e)
+        return
+    r.check("電池に残ったデータがあっても起動する", True)
+
+    after = nes.snapshot_prg_ram()
+    if after == residual:
+        diff = ""
+    else:
+        first = next(i for i in range(len(residual)) if after[i] != residual[i])
+        count = sum(1 for i in range(len(residual)) if after[i] != residual[i])
+        diff = ("$6000-$7FFF の %d バイトが起動処理で書き換わった（最初の相違 $%04X: "
+                "$%02X -> $%02X）。起動時の RAM クリアがセーブ領域まで巻き込んでいる＝"
+                "**電源を入れるたびにプレイヤーのセーブが消える**。"
+                "セーブ領域の読み書きは P4 の campaign-dev の担当で、"
+                "engine の起動処理は $A001 の有効化までしか触らない（%s）"
+                % (count, 0x6000 + first, residual[first], after[first], ADR1))
+    r.check("起動処理がセーブ領域を消去していない", after == residual, diff)
 
 
 # ---------------------------------------------------------------- L3
