@@ -6,9 +6,9 @@
 
 | ファイル | 内容 | 担当 | 着手 |
 |---|---|---|---|
-| `scenario.tsv` | 話ID、タイルセットID、レイアウトID、プロップセットID、ギミックID、敵ウェーブ、プール定義 | campaign-dev | P4 |
+| `scenario.tsv` | 話ID、タイルセットID、レイアウトID、プロップセットID、ギミックID、敵ウェーブ、プール定義、**オートセーブポイント列**（ADR-0001） | campaign-dev | P4 |
 | `roster.tsv` | キャラID、家系、体格型、AI型、パレット、固有必殺、世代、加入条件フラグ | campaign-dev | P2 |
-| `flags.tsv` | フラグID定義（分岐、処遇、生存、縁値、研究配分） | campaign-dev | P4 |
+| `flags.tsv` | フラグID定義（分岐、処遇、恒久離脱、縁値、研究配分） | campaign-dev | P4 |
 | `ai_params.tsv` | AI 6型のパラメータ表 | ai-dev | P2 |
 | `layouts/` | ステージのジオメトリ | stage-author | P3 |
 | `props/` | レイアウトID × 時代 → 物体配置リスト（1時代 200〜400 B） | stage-author | P3 |
