@@ -4,12 +4,16 @@ PPU はレジスタの振る舞いと VRAM/OAM への副作用だけを再現す
 描画は行わない。スキャンライン単位のタイミング（スプライト欠け、MMC3 IRQ）は
 再現しないので、その検証は Mesen2 側で行うこと（ADR-0004）。
 """
-from cpu6502 import Cpu, CpuCrash
+from cpu6502 import Cpu, CpuCrash, FLAG_C, FLAG_Z, FLAG_N, FLAG_V
 
 CYCLES_PER_FRAME = 29780        # NTSC の1フレームの CPU サイクル数（近似）
 VBLANK_CYCLES = 2273            # VBlank 期間の CPU サイクル数（近似）
 
 BUTTONS = ("A", "B", "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT")
+
+# Nes.call() が「サブルーチンから戻ってきた」ことを検出するための番兵アドレス。
+# ROM にも RAM にも属さない領域を選んである（ここが実行されることは無い）。
+CALL_RETURN = 0x4100
 
 
 class Rom:
@@ -173,6 +177,39 @@ class Mmc3:
             self.irq_enabled = not even
 
 
+class CallResult:
+    """Nes.call() の戻り。サブルーチンが返したレジスタとフラグ。"""
+
+    def __init__(self, a, x, y, p, cycles, instructions, sp_delta):
+        self.a = a
+        self.x = x
+        self.y = y
+        self.p = p
+        self.cycles = cycles
+        self.instructions = instructions
+        self.sp_delta = sp_delta        # 0 以外ならスタックの出し入れが釣り合っていない
+
+    @property
+    def carry(self):
+        return bool(self.p & FLAG_C)
+
+    @property
+    def zero(self):
+        return bool(self.p & FLAG_Z)
+
+    @property
+    def negative(self):
+        return bool(self.p & FLAG_N)
+
+    @property
+    def overflow(self):
+        return bool(self.p & FLAG_V)
+
+    def __repr__(self):
+        return ("CallResult(A=$%02X X=$%02X Y=$%02X C=%d Z=%d N=%d, %dサイクル)"
+                % (self.a, self.x, self.y, self.carry, self.zero, self.negative, self.cycles))
+
+
 class Nes:
     def __init__(self, rom_path, prg_ram_fill=0x00):
         """prg_ram_fill: 電源投入時の PRG-RAM の中身（1バイト or bytes）。
@@ -206,6 +243,10 @@ class Nes:
         self.dma_count = 0
         self.frame = 0
         self.oam_dma_page = None
+        self.write_log = None       # list を入れると CPU の書き込みを (アドレス, 値) で記録する
+        self.trace_nmi = False      # True にすると NMI ハンドラを単体で実行し、費用を測る
+        self.nmi_cycles = None      # 直近の NMI ハンドラのサイクル数（trace_nmi 時のみ）
+        self.nmi_writes = []        # 直近の NMI ハンドラが行った書き込み（trace_nmi 時のみ）
 
     def snapshot_prg_ram(self):
         """セーブ領域 ($6000-$7FFF) の内容を取り出す（バスを経由しない検査用）。"""
@@ -242,6 +283,8 @@ class Nes:
         return self.mapper.read(addr)
 
     def write(self, addr, value):
+        if self.write_log is not None:
+            self.write_log.append((addr, value))
         if addr < 0x2000:
             self.ram[addr & 0x7FF] = value
         elif addr < 0x4000:
@@ -292,15 +335,81 @@ class Nes:
         """1フレーム進める。可視期間 -> VBlank(NMI) -> 復帰。"""
         self.run_cycles(CYCLES_PER_FRAME - VBLANK_CYCLES)
         self.ppu.in_vblank = True
+        spent = 0
         if self.ppu.nmi_enabled:
-            self.cpu.nmi()
-        self.run_cycles(VBLANK_CYCLES)
+            if self.trace_nmi:
+                spent = self._run_nmi_handler()
+            else:
+                self.cpu.nmi()
+        if spent < VBLANK_CYCLES:
+            self.run_cycles(VBLANK_CYCLES - spent)
         self.ppu.in_vblank = False
         self.frame += 1
 
     def run_frames(self, n):
         for _ in range(n):
             self.run_frame()
+
+    def _run_nmi_handler(self, budget_instructions=100000):
+        """NMI を起動し、rti で戻るまでを単体で実行する。
+
+        戻り値はハンドラが使ったサイクル数（NMI 応答の7サイクルと、$4014 への書き込みが
+        止める 513 サイクルを含む）。このエミュレータは命令単位の近似なので、この値は
+        「VBlank 予算に対しておおよそどれくらいか」を見るためのものである。
+        スキャンライン単位の正確なタイミング検証は Mesen2 の仕事（ADR-0004）。
+        """
+        cpu = self.cpu
+        sp_before = cpu.sp
+        start = cpu.cycles
+        outer_log = self.write_log
+        self.write_log = []
+        cpu.nmi()
+        executed = 0
+        try:
+            while cpu.sp != sp_before:
+                cpu.step()
+                executed += 1
+                if executed > budget_instructions:
+                    raise CpuCrash("NMI ハンドラが %d 命令実行しても rti に到達しない: PC=$%04X。"
+                                   "NMI の中で待ちループに入っている疑い" % (executed, cpu.pc))
+        finally:
+            self.nmi_writes = self.write_log
+            self.write_log = outer_log
+        self.nmi_cycles = cpu.cycles - start
+        return self.nmi_cycles
+
+    def call(self, addr, a=0, x=0, y=0, carry=False, budget_instructions=200000):
+        """指定アドレスを jsr して rts で戻るまで実行し、CallResult を返す。
+
+        power_cycle() と同じ性格の足場である。サブルーチン（rect_overlap のように
+        引数がゼロページとレジスタで渡るもの）を、ゲームの進行を待たずに単体で叩くために使う。
+        呼び出しの前後で CPU の状態（PC/SP/レジスタ）は復元するので、
+        メインループを走らせている途中で割り込んで呼んでも続きを走らせられる。
+        """
+        cpu = self.cpu
+        saved = (cpu.pc, cpu.sp, cpu.a, cpu.x, cpu.y, cpu.p)
+        ret = (CALL_RETURN - 1) & 0xFFFF
+        cpu.push(ret >> 8)
+        cpu.push(ret & 0xFF)
+        cpu.pc = addr & 0xFFFF
+        cpu.a, cpu.x, cpu.y = a & 0xFF, x & 0xFF, y & 0xFF
+        cpu.set_flag(FLAG_C, carry)
+        start = cpu.cycles
+        executed = 0
+        try:
+            while cpu.pc != CALL_RETURN:
+                cpu.step()
+                executed += 1
+                if executed > budget_instructions:
+                    raise CpuCrash("$%04X を呼んで %d 命令実行しても rts で戻ってこない: PC=$%04X。"
+                                   "無限ループか、スタックを壊して別の場所へ飛んでいる"
+                                   % (addr, executed, cpu.pc))
+        finally:
+            sp_after = cpu.sp
+            result_regs = (cpu.a, cpu.x, cpu.y, cpu.p)
+            cpu.pc, cpu.sp, cpu.a, cpu.x, cpu.y, cpu.p = saved
+        return CallResult(result_regs[0], result_regs[1], result_regs[2], result_regs[3],
+                          cpu.cycles - start, executed, sp_after - saved[1])
 
 
 def load_labels(path):

@@ -15,10 +15,12 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "harness"))
+sys.path.insert(0, HERE)
 
 from cpu6502 import CpuCrash            # noqa: E402
 from nes import Nes, Rom, load_labels   # noqa: E402
 from routes import parse_route, play, RouteError   # noqa: E402
+from l2_engine import layer2_engine, OAM_SPRITE_MAX  # noqa: E402
 
 
 ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途のオートセーブ）"
@@ -165,8 +167,40 @@ def layer2_execution(rom_path, labels, r):
     y, tile, attr, x = nes.ppu.oam[0:4]
     r.check("スプライト0 が画面内にいる (y=%d, x=%d)" % (y, x), 0 < y < 0xEF and 0 < x < 0xF8,
             "OAM[0..3] = %s。画面外に置かれている" % list(nes.ppu.oam[0:4]))
-    r.check("スプライト0 以外は画面外に退避している", all(v == 0xFF for v in nes.ppu.oam[4:8]),
-            "OAM[4..7] = %s。未使用スプライトは y=$FF で隠す" % list(nes.ppu.oam[4:8]))
+
+    # 「使っていない OAM エントリは画面外に隠れている」ことの検証。
+    # P0 では画面上のスプライトが1個だったので OAM[4..] 全部が $FF だったが、
+    # P1 からは複数のエンティティが並ぶので「1個だけ」は定義上成立しない。
+    # 境界は oam_used（sprite.s が毎フレーム書く「使った OAM エントリ数」）が持つ。
+    # ここが崩れると、前フレームに出ていたスプライトが消えずに残る（幽霊スプライト）。
+    # 起動処理は OAM シャドウを1回 $FF で埋める。それだけでも「未使用は $FF」は
+    # 見かけ上成立してしまうので、わざと汚してから走らせ、
+    # **毎フレームの OAM 構築が** 未使用エントリを隠し直していることを見る。
+    shadow_base = labels.get("oam_shadow", 0x0200)
+    for i in range(OAM_SPRITE_MAX):
+        nes.ram[(shadow_base + i * 4) & 0x7FF] = 0x50
+    nes.run_frames(2)
+
+    oam_used_addr = labels.get("oam_used")
+    if oam_used_addr is None:
+        r.check("未使用の OAM エントリが画面外に隠れている", False,
+                "ラベル oam_used が build/roaring.labels に無い。"
+                "sprite.s が使用済みエントリ数を公開しなくなったか、.export が消えている")
+    else:
+        used = nes.ram[oam_used_addr & 0x7FF]
+        stale = [i for i in range(used, OAM_SPRITE_MAX) if nes.ppu.oam[i * 4] != 0xFF]
+        r.check("未使用の OAM エントリ (#%d 以降) が画面外に隠れている" % used, not stale,
+                "OAM #%s の Y が $FF でない（先頭は #%d: Y=%d）。使用済み %d 個の後ろは "
+                "$FF で隠すこと。隠し忘れると前フレームのスプライトが残って画面に出る"
+                % (stale[:8], stale[0] if stale else -1,
+                   nes.ppu.oam[stale[0] * 4] if stale else -1, used))
+        # 上の検証が「使用 0 個」「使用 64 個」で素通りしないことを確かめる。
+        # oam_used が壊れて 64 になると、上の検証は何も見ずに成功してしまう。
+        r.check("oam_used が妥当な範囲にある (0 < %d < %d)" % (used, OAM_SPRITE_MAX),
+                0 < used < OAM_SPRITE_MAX,
+                "oam_used=%d。この画面には操作キャラ1体と敵3体が居るので 0 でも 64 でもないはず。"
+                "0 なら何も描いていない、64 なら上の「未使用エントリ」の検証が空振りになる"
+                % used)
 
     if labels and "frame_counter" in labels:
         fc = nes.ram[labels["frame_counter"] & 0x7FF]
@@ -344,6 +378,8 @@ def main(argv=None):
     if layer1_structure(args.rom, labels, r) is not None:
         print()
         layer2_execution(args.rom, labels, r)
+        print()
+        layer2_engine(args.rom, labels, r)
     print()
     ran_l3 = layer3_mesen(args.rom, r)
 
