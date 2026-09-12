@@ -1,0 +1,83 @@
+; constants.inc — プロジェクト全体の定数。マジックナンバーはここに集約する。
+.ifndef CONSTANTS_INC
+CONSTANTS_INC = 1
+
+; ---- PPU ----
+PPUCTRL   = $2000
+PPUMASK   = $2001
+PPUSTATUS = $2002
+OAMADDR   = $2003
+OAMDATA   = $2004
+PPUSCROLL = $2005
+PPUADDR   = $2006
+PPUDATA   = $2007
+OAMDMA    = $4014
+
+; PPUCTRL ビット
+CTRL_NMI_ON    = %10000000
+CTRL_SPR_8X16  = %00100000
+CTRL_BG_1000   = %00010000
+CTRL_SPR_0000  = %00000000
+CTRL_INC_1     = %00000000
+
+; PPUMASK ビット
+MASK_SHOW_BG   = %00001000
+MASK_SHOW_SPR  = %00010000
+MASK_BG_LEFT   = %00000010
+MASK_SPR_LEFT  = %00000100
+
+; ---- APU / 入力 ----
+APU_DMC_FREQ   = $4010
+APU_STATUS     = $4015
+APU_FRAME      = $4017
+JOYPAD1        = $4016
+JOYPAD2        = $4017
+
+; パッドビット（$4016 の読み出し順）
+PAD_A      = %10000000
+PAD_B      = %01000000
+PAD_SELECT = %00100000
+PAD_START  = %00010000
+PAD_UP     = %00001000
+PAD_DOWN   = %00000100
+PAD_LEFT   = %00000010
+PAD_RIGHT  = %00000001
+
+; ---- MMC3 (Mapper 4) ----
+MMC3_BANK_SELECT = $8000   ; 偶数アドレス
+MMC3_BANK_DATA   = $8001   ; 奇数アドレス
+MMC3_MIRRORING   = $A000
+MMC3_PRG_RAM     = $A001
+MMC3_IRQ_LATCH   = $C000
+MMC3_IRQ_RELOAD  = $C001
+MMC3_IRQ_DISABLE = $E000
+MMC3_IRQ_ENABLE  = $E001
+
+MMC3_PRG_MODE_0  = %00000000   ; $8000 可変 / $C000 固定
+MMC3_CHR_MODE_0  = %00000000   ; $0000 に 2KB×2 / $1000 に 1KB×4
+
+MIRROR_VERTICAL   = 0
+MIRROR_HORIZONTAL = 1
+
+; ---- OAM ----
+; OAM シャドウの実体は src/oam.s（セグメント OAM）。アドレスはリンカが決める。
+OAM_SPRITE_MAX  = 64
+OAM_Y_OFFSCREEN = $FF
+
+; OAM 1エントリのオフセット
+OAM_Y    = 0
+OAM_TILE = 1
+OAM_ATTR = 2
+OAM_X    = 3
+
+; ---- ゲーム基本定数 ----
+; レーン数は4に固定。ADR なしに変更してはならない（CLAUDE.md 第5条）。
+LANE_COUNT = 4
+
+; 1画面の敵同時数は ADR-0002 の決定待ち。暫定値であり、決定後に置き換える。
+MAX_ENEMIES = 4
+
+; パーティ（操作1＋自律2）
+PARTY_SIZE = 3
+
+.endif
