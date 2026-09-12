@@ -43,8 +43,12 @@ mmc3_select_shadow: .res 1      ; $8000 に最後に書いた値
 
         jsr mmc3_irq_disable
 
-        lda #0
-        sta MMC3_PRG_RAM         ; PRG-RAM 無効（ADR-0001 の決定までは使わない）
+        ; PRG-RAM ($6000-$7FFF) を有効かつ書き込み可にする。
+        ; ADR-0001（案A: バッテリーバックアップ）で決定済み。セーブデータの実体は
+        ; ここに置き、シナリオ中途の複数ポイントでオートセーブする。
+        ; 書き込み禁止に落としたい区間があれば MMC3_PRGRAM_RO を使うこと。
+        lda #MMC3_PRGRAM_RW
+        sta MMC3_PRG_RAM
         rts
 .endproc
 
