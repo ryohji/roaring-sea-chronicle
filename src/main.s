@@ -7,7 +7,8 @@
 .import ent_clear_all, ent_activate, ent_lane_move
 .import ent_x_lo, ent_x_hi, ent_lane, ent_lane_step
 .import ent_state, ent_class, ent_body, ent_tile, ent_attr
-.import lane_update_all, oam_build
+.import lane_update_all, oam_build, cam_update
+.import stage_w_lo, stage_w_hi
 
 ; --- P1 の動作確認用シーンのパラメータ ---
 ; ここにあるのは engine の経路（入力 → エンティティ → レーン補間 → OAM → 画面）が
@@ -16,6 +17,7 @@
 PLAYER_HOME_X    = 120
 PLAYER_HOME_LANE = 2
 PLAYER_SPEED     = 1          ; 手触りの値ではない。動きが見えればよい
+PLAYER_EDGE_MARGIN = 16       ; ステージ右端に残す余白（体1つぶん）
 TEST_TILE_FIGURE = 0          ; 仮CHR: タイル0/1 が 8x16 の人型
 TEST_ATTR_PLAYER = 0          ; スプライトパレット0
 TEST_ATTR_ENEMY  = 1          ; スプライトパレット1
@@ -36,24 +38,37 @@ TEST_ENEMY_COUNT = 3
         jsr scene_test_init
         jsr oam_build           ; 最初の DMA に間に合うよう1回組んでおく
 
-        ; NMI を有効化して描画を開始する
-        lda #(CTRL_NMI_ON | CTRL_SPR_8X16)
+        ; 描画を開始する。値はシャドウが持っている（init_system が決めた）。
+        ; ここで固定値を直書きしないこと。NMI と、のちのステータスバー分割 IRQ が
+        ; 同じシャドウを読んで書き戻すので、出どころが2つあると競合する。
+        ; スクロールを先に置いてから描画を有効にする。初期転送で PPUADDR を
+        ; 動かしたままにしてあるので、置き直さないと最初の1フレームが流れて見える。
+        bit PPUSTATUS
+        lda ppu_ctrl_shadow              ; ここで初めて NMI 許可ビットが立つ
         sta PPUCTRL
-        lda #(MASK_SHOW_SPR | MASK_SPR_LEFT)   ; 背景はまだ無い。スプライトのみ
+        lda cam_x_lo
+        sta PPUSCROLL
+        lda #0
+        sta PPUSCROLL
+        lda ppu_mask_shadow
         sta PPUMASK
 
         cli
         jmp main_loop
 .endproc
 
-; 1フレームの並び。OAM の構築（並べ替えと展開）は**描画期間中**に済ませ、
-; NMI は完成済みバッファを DMA するだけにする（CLAUDE.md 第4節 / ADR-0002）。
+; 1フレームの並び。OAM の構築（並べ替えと展開）と VRAM 転送の積み込みは
+; **描画期間中**に済ませ、NMI は完成済みのものを流すだけにする
+; （CLAUDE.md 第4節 / ADR-0002）。
+; cam_update を oam_build より前に置いてあるのは、同じフレームのカメラ位置で
+; スプライトを組むためである。ここが前後すると、スクロール中に背景とキャラが1フレームずれる。
 .proc main_loop
 @frame:
         jsr wait_nmi
         jsr read_pad
         jsr update_player_test
         jsr lane_update_all
+        jsr cam_update          ; カメラ追従 + 現れた列を転送キューへ
         jsr oam_build
         jmp @frame
 .endproc
@@ -132,15 +147,29 @@ TEST_ENEMY_COUNT = 3
 .proc update_player_test
         ldx #ENT_PLAYER
 
+        ; 左: ワールドの左端 (0) を越えさせない。
+        ; 越えると 16bit が巻き取って「ステージの遥か右」になり、カメラが飛ぶ。
         lda pad_state
         and #PAD_LEFT
         beq @check_right
         lda ent_x_lo, x
         sec
         sbc #PLAYER_SPEED
+        sta tmp0
+        lda ent_x_hi, x
+        sbc #0
+        bcc @hit_left
+        sta ent_x_hi, x
+        lda tmp0
         sta ent_x_lo, x
-        bcs @check_right
-        dec ent_x_hi, x
+        jmp @check_right
+@hit_left:
+        lda #0
+        sta ent_x_lo, x
+        sta ent_x_hi, x
+
+        ; 右: ステージの右端を越えさせない。
+        ; ステージ幅は scroll.s が持っている（ここに長さを埋めない）。
 @check_right:
         lda pad_state
         and #PAD_RIGHT
@@ -148,9 +177,36 @@ TEST_ENEMY_COUNT = 3
         lda ent_x_lo, x
         clc
         adc #PLAYER_SPEED
+        sta tmp0
+        lda ent_x_hi, x
+        adc #0
+        sta tmp1
+
+        lda stage_w_lo                   ; 限界 = ステージ幅 - 体1つぶん
+        sec
+        sbc #PLAYER_EDGE_MARGIN
+        sta tmp2
+        lda stage_w_hi
+        sbc #0
+        sta tmp3
+
+        lda tmp3                         ; 限界 < 新しい位置 ならクランプ
+        cmp tmp1
+        bcc @hit_right
+        bne @store_x
+        lda tmp2
+        cmp tmp0
+        bcs @store_x
+@hit_right:
+        lda tmp2
+        sta tmp0
+        lda tmp3
+        sta tmp1
+@store_x:
+        lda tmp0
         sta ent_x_lo, x
-        bcc @check_lane
-        inc ent_x_hi, x
+        lda tmp1
+        sta ent_x_hi, x
 
 @check_lane:
         lda ent_lane_step, x

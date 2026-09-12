@@ -29,17 +29,38 @@
 
 .segment "BSS"
 
+; 挿入ソートの番兵。下の @shift が `oam_sortkey - 1, y` を読むので、y=0 のときに
+; ここが読まれる。番兵には必ず「どのキーよりも小さいか等しい値」($00) を入れるので、
+; y=0 では必ず「ここに入る」と判定されてループが止まる。
+; 以前は直前の cpy #0 / beq が y=0 への到達を防いでいたが、その1本に頼る形だと、
+; 番人が外れた瞬間に**隣の配列を並べ替えキーとして読む**という気付きにくい壊れ方をする。
+; 番兵なら、配列の1バイト手前を読むこと自体が正しい動作になる。
+oam_sortkey_guard: .res 1
+oam_sortkey: .res MAX_ENTITIES    ; キー（挿入位置を探すのに使う）
+.assert oam_sortkey - 1 = oam_sortkey_guard, error, "番兵が oam_sortkey の直前に無い"
+
+; oam_order も同じ添字で1バイト手前を読むので、同じ形にしておく
+;（キーの比較で必ず先に抜けるため実際には読まれないが、並びを揃えておく）。
+oam_order_guard: .res 1
 oam_order:   .res MAX_ENTITIES    ; 出す順に並べたエンティティ番号
-oam_sortkey: .res MAX_ENTITIES    ; 同じ並びのキー（挿入位置を探すのに使う）
+.assert oam_order - 1 = oam_order_guard, error, "番兵が oam_order の直前に無い"
+
 oam_dropped: .res 1               ; 64 スプライトに入り切らず捨てた個数（P2 の実験とデバッグ用）
 oam_used:    .res 1               ; 実際に使った OAM エントリ数
 
 .segment "CODE"
 
 ; 毎フレーム1回、メインループから呼ぶ。
+; 構築中は oam_ready を下ろす。NMI はこれを見て、組み立て途中の OAM シャドウを
+; DMA しないようにする（1フレームの処理が溢れたときに、上半身だけ新しい絵が出るのを防ぐ）。
 .proc oam_build
+        lda #0
+        sta oam_ready
         jsr oam_sort_order
-        jmp oam_emit
+        jsr oam_emit
+        lda #1
+        sta oam_ready
+        rts
 .endproc
 
 ; ---------------------------------------------------------------- 並べ替え
@@ -51,6 +72,7 @@ oam_used:    .res 1               ; 実際に使った OAM エントリ数
 .proc oam_sort_order
         lda #0
         sta sort_count
+        sta oam_sortkey_guard            ; 番兵を張り直す（不変条件に頼らない）
         ldx #0
 @scan:
         lda ent_active, x
@@ -76,10 +98,11 @@ oam_used:    .res 1               ; 実際に使った OAM エントリ数
         sta tmp1                         ; tmp1 = キー
 
         ; --- 挿入位置まで後ろへずらす ---
+        ; y=0 では番兵 ($00) を読む。新キーは 0 以上なので必ず bcc/beq のどちらかが
+        ; 成立して @insert へ抜ける。よってループの停止は「番兵の値」だけで保証され、
+        ; 手前に置いた比較や添字の下限チェックに依存しない。
         ldy sort_count
 @shift:
-        cpy #0
-        beq @insert
         lda oam_sortkey - 1, y
         cmp tmp1
         bcc @insert                      ; 既存キー < 新キー → ここに入る

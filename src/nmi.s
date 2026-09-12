@@ -1,11 +1,22 @@
 ; nmi.s — NMI ハンドラ。
 ; ここで行ってよいのは OAM DMA・VRAM 転送・スクロール設定・IRQ設定だけである。
 ; ゲームロジックを書いてはならない（CLAUDE.md 第4節）。
+;
+; 1フレームの並び:
+;   OAM DMA（約513サイクル）→ VRAM 転送キュー（予算のぶんだけ）→ スクロール設定
+; VRAM 転送を**スクロール設定より先**に置いてあるのは順序の要件である。
+; $2006 への書き込みは PPU の内部アドレスを壊すので、$2005/$2000 でスクロールを
+; 置き直すのは必ずそのあとでなければならない。
+;
+; PPUCTRL / PPUMASK は固定値を直書きせず、シャドウ（zeropage）を書く。
+; ステータスバー分割の MMC3 スキャンライン IRQ を入れると IRQ ハンドラも
+; これらを触るので、値の出どころを一箇所にしておかないと競合する。
 .include "constants.inc"
 .include "zeropage.inc"
 
 .export nmi_handler, irq_handler
 .import oam_shadow
+.import vram_queue_flush
 
 .segment "CODE"
 
@@ -17,24 +28,34 @@
         pha
 
         ; --- OAM DMA（VBlank 中に必ず行う。約 513 サイクル）---
+        ; oam_ready が下りているときは、メインループが OAM シャドウを組み立てている
+        ; 最中である。そのまま DMA すると「上半身だけ新しい」中途半端な OAM を
+        ; 転送してしまう。1フレーム前の完成品を出したままにする方がまだ見られる。
+        lda oam_ready
+        beq @no_dma
         lda #0
         sta OAMADDR
         lda #>oam_shadow
         sta OAMDMA
+@no_dma:
+
+        ; --- VRAM 転送（スクロールで現れた列・属性・パレットなど）---
+        ; 予算で刻むのはキューの側の仕事。ここは呼ぶだけである。
+        jsr vram_queue_flush
 
         ; --- スクロール設定 ---
-        ; いまは原点固定。カメラ（zeropage の cam_x_lo/hi）を実際にここへ流し込むのは
-        ; 横スクロールの作業（次回）である。OAM 構築側はすでに
-        ; 「画面X = ワールドX - カメラX」で組んであるので、差し替えはここと
-        ; ネームテーブル更新のキューだけで済む。
-        bit PPUSTATUS
-        lda #0
-        sta PPUSCROLL
-        sta PPUSCROLL
-
-        lda #(CTRL_NMI_ON | CTRL_SPR_8X16)
+        ; ネームテーブルは左右に2枚（垂直ミラーリング）。カメラX の bit8 が
+        ; そのままベースネームテーブルの選択ビットになる。
+        bit PPUSTATUS                    ; $2005/$2006 の書き込みラッチを倒しておく
+        lda cam_x_hi
+        and #CTRL_NT_X
+        ora ppu_ctrl_shadow
         sta PPUCTRL
-        lda #(MASK_SHOW_SPR | MASK_SPR_LEFT)   ; 背景はまだ無い。スプライトのみ
+        lda cam_x_lo
+        sta PPUSCROLL                    ; 横
+        lda #0
+        sta PPUSCROLL                    ; 縦（横スクロール専用なので常に 0）
+        lda ppu_mask_shadow
         sta PPUMASK
 
         inc frame_counter
@@ -49,7 +70,8 @@
         rti
 .endproc
 
-; IRQ は MMC3 のスキャンライン IRQ（ステータスバー分割）用。P0 では何もしない。
+; IRQ は MMC3 のスキャンライン IRQ（ステータスバー分割）用。P1 では何もしない。
+; ここを実装するときは、PPUCTRL/PPUMASK をシャドウ経由で触ること。
 .proc irq_handler
         rti
 .endproc

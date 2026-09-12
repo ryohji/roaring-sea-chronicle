@@ -6,6 +6,7 @@
 .export init_system
 .import mmc3_init, mmc3_set_mirroring
 .import oam_shadow
+.import scroll_init
 
 .segment "CODE"
 
@@ -54,9 +55,27 @@
         bpl @vblank2
 
         jsr mmc3_init
-        lda #MIRROR_HORIZONTAL   ; ベルトスクロールは横スクロールなので水平ミラーリング
+
+        ; 横スクロールには**垂直**ミラーリングを使う。
+        ; NES の用語は紛らわしいが、垂直ミラーリング = ネームテーブルが**左右**に2枚並ぶ
+        ; （$2000 と $2400 が別の内容を持ち、$2800/$2C00 がその写し）配置である。
+        ; 水平ミラーリングだと $2000 と $2400 が同じ内容になり、横スクロールで
+        ; 右から出てくる画面が左と同じものになってしまう。
+        lda #MIRROR_VERTICAL
         jsr mmc3_set_mirroring
+
+        ; PPUCTRL / PPUMASK のシャドウを決める。以降ここ以外で固定値を直書きしない
+        ; （NMI も、ステータスバー分割の IRQ も、このシャドウを読んで書く）。
+        ;   背景パターンテーブルは $1000 側。スプライトは 8x16 モードなので
+        ;   タイル番号の bit0 がパターンテーブルを選ぶ（PPUCTRL bit3 は効かない）。
+        ;   ネームテーブル選択ビットは 0 のままにしておくこと。NMI が cam_x から載せる。
+        lda #(CTRL_NMI_ON | CTRL_SPR_8X16 | CTRL_BG_1000 | CTRL_INC_1)
+        sta ppu_ctrl_shadow
+        lda #(MASK_SHOW_BG | MASK_SHOW_SPR | MASK_BG_LEFT | MASK_SPR_LEFT)
+        sta ppu_mask_shadow
+
         jsr load_palette
+        jsr scroll_init          ; カメラを原点に置き、画面1枚ぶんの仮背景を書く
         rts
 .endproc
 
