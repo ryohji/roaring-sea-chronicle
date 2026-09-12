@@ -3,11 +3,24 @@
 .include "zeropage.inc"
 
 .export reset_handler
-.import init_system, read_pad, oam_shadow
+.import init_system, read_pad
+.import ent_clear_all, ent_activate, ent_lane_move
+.import ent_x_lo, ent_x_hi, ent_lane, ent_lane_step
+.import ent_state, ent_class, ent_body, ent_tile, ent_attr
+.import lane_update_all, oam_build
 
-; P0 の動作確認用スプライトの初期位置
-SPRITE_HOME_X = 120
-SPRITE_HOME_Y = 112
+; --- P1 の動作確認用シーンのパラメータ ---
+; ここにあるのは engine の経路（入力 → エンティティ → レーン補間 → OAM → 画面）が
+; 繋がっていることを確かめるための仮置きである。ステージの中身は P3 で
+; stage-author が data/ から読む形に置き換える。ここに固有名詞を増やしてはならない。
+PLAYER_HOME_X    = 120
+PLAYER_HOME_LANE = 2
+PLAYER_SPEED     = 1          ; 手触りの値ではない。動きが見えればよい
+TEST_TILE_FIGURE = 0          ; 仮CHR: タイル0/1 が 8x16 の人型
+TEST_ATTR_PLAYER = 0          ; スプライトパレット0
+TEST_ATTR_ENEMY  = 1          ; スプライトパレット1
+TEST_ENEMY_COUNT = 3
+
 .segment "CODE"
 
 .proc reset_handler
@@ -20,23 +33,28 @@ SPRITE_HOME_Y = 112
 
         jsr init_system
 
-        jsr setup_test_sprite
+        jsr scene_test_init
+        jsr oam_build           ; 最初の DMA に間に合うよう1回組んでおく
 
         ; NMI を有効化して描画を開始する
         lda #(CTRL_NMI_ON | CTRL_SPR_8X16)
         sta PPUCTRL
-        lda #(MASK_SHOW_SPR | MASK_SPR_LEFT)   ; P0 は黒画面＋スプライトのみ
+        lda #(MASK_SHOW_SPR | MASK_SPR_LEFT)   ; 背景はまだ無い。スプライトのみ
         sta PPUMASK
 
         cli
         jmp main_loop
 .endproc
 
+; 1フレームの並び。OAM の構築（並べ替えと展開）は**描画期間中**に済ませ、
+; NMI は完成済みバッファを DMA するだけにする（CLAUDE.md 第4節 / ADR-0002）。
 .proc main_loop
 @frame:
         jsr wait_nmi
         jsr read_pad
-        jsr update_test_sprite
+        jsr update_player_test
+        jsr lane_update_all
+        jsr oam_build
         jmp @frame
 .endproc
 
@@ -50,32 +68,123 @@ SPRITE_HOME_Y = 112
         rts
 .endproc
 
-; --- P0 の動作確認用スプライト（8x16 を1体）---
-; P1 で engine-dev のスプライト割当に置き換える。
-.proc setup_test_sprite
-        lda #SPRITE_HOME_Y
-        sta oam_shadow + OAM_Y
-        lda #0                          ; 8x16 モードではタイル番号の bit0 がパターンテーブル選択
-        sta oam_shadow + OAM_TILE
-        lda #0                          ; パレット0、前面
-        sta oam_shadow + OAM_ATTR
-        lda #SPRITE_HOME_X
-        sta oam_shadow + OAM_X
+; --- P1 の動作確認用シーン ---
+; 操作キャラ1体と、静止した敵3体を別々のレーンに置く。
+; 敵の思考（AI）は ai-dev の範囲なので書かない。ここでは「置くだけ」である。
+.proc scene_test_init
+        jsr ent_clear_all
+
+        ldx #ENT_PLAYER
+        lda #<PLAYER_HOME_X
+        sta ent_x_lo, x
+        lda #>PLAYER_HOME_X
+        sta ent_x_hi, x
+        lda #PLAYER_HOME_LANE
+        sta ent_lane, x
+        lda #SPR_CLASS_PLAYER
+        sta ent_class, x
+        lda #BODY_PLACEHOLDER
+        sta ent_body, x
+        lda #TEST_TILE_FIGURE
+        sta ent_tile, x
+        lda #TEST_ATTR_PLAYER
+        sta ent_attr, x
+        lda #ENT_ST_IDLE
+        sta ent_state, x
+        jsr ent_activate
+
+        ldx #ENT_ENEMY_FIRST
+        ldy #0
+@enemy:
+        lda test_enemy_x, y
+        sta ent_x_lo, x
+        lda #0
+        sta ent_x_hi, x
+        lda test_enemy_lane, y
+        sta ent_lane, x
+        lda test_enemy_body, y
+        sta ent_body, x
+        lda #SPR_CLASS_FAR_ENE
+        sta ent_class, x
+        lda #TEST_TILE_FIGURE
+        sta ent_tile, x
+        lda #TEST_ATTR_ENEMY
+        sta ent_attr, x
+        lda #ENT_ST_IDLE
+        sta ent_state, x
+        tya
+        pha
+        jsr ent_activate
+        pla
+        tay
+        inx
+        iny
+        cpy #TEST_ENEMY_COUNT
+        bne @enemy
         rts
 .endproc
 
-; 十字キーで左右に動かす。手触りの実装ではなく、
-; 「入力 → OAM → 画面」の経路が繋がっていることの確認である。
-.proc update_test_sprite
+; 十字キーで操作キャラを動かす。手触りの実装ではなく、
+; 「入力 → エンティティ → レーン補間 → OAM → 画面」の経路の確認である。
+;   左右: ワールドX を動かす（16bit）
+;   上下: レーンを1つ移動する（押した瞬間だけ。移動は lane.s が補間する）
+; 実際の移動と攻撃は action-dev が書く。ここは engine の確認用に留めること。
+.proc update_player_test
+        ldx #ENT_PLAYER
+
         lda pad_state
         and #PAD_LEFT
         beq @check_right
-        dec oam_shadow + OAM_X
+        lda ent_x_lo, x
+        sec
+        sbc #PLAYER_SPEED
+        sta ent_x_lo, x
+        bcs @check_right
+        dec ent_x_hi, x
 @check_right:
         lda pad_state
         and #PAD_RIGHT
+        beq @check_lane
+        lda ent_x_lo, x
+        clc
+        adc #PLAYER_SPEED
+        sta ent_x_lo, x
+        bcc @check_lane
+        inc ent_x_hi, x
+
+@check_lane:
+        lda ent_lane_step, x
+        bne @done                ; 補間中は次のレーン移動を受け付けない
+        lda pad_pressed
+        and #PAD_UP
+        beq @check_down
+        lda ent_lane, x
+        beq @done                ; レーン0 より奥は無い
+        sec
+        sbc #1
+        jsr ent_lane_move
+        rts
+@check_down:
+        lda pad_pressed
+        and #PAD_DOWN
         beq @done
-        inc oam_shadow + OAM_X
+        lda ent_lane, x
+        cmp #LANE_LAST
+        bcs @done                ; 最も手前のレーンより先は無い
+        clc
+        adc #1
+        jsr ent_lane_move
 @done:
         rts
 .endproc
+
+.segment "RODATA"
+
+; 確認用の敵の配置。レーンごとの前後関係と体格型ごとのタイル数が
+; 画面で見えるように、別レーン・別体格で置いてある。
+test_enemy_x:
+        .byte 64, 176, 112
+test_enemy_lane:
+        .byte 0, 1, LANE_LAST
+test_enemy_body:
+        .byte BODY_HEAVY, BODY_LIGHT, BODY_PLACEHOLDER

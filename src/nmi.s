@@ -23,7 +23,10 @@
         sta OAMDMA
 
         ; --- スクロール設定 ---
-        ; P0 では固定。横スクロールは P1 で engine-dev が実装する。
+        ; いまは原点固定。カメラ（zeropage の cam_x_lo/hi）を実際にここへ流し込むのは
+        ; 横スクロールの作業（次回）である。OAM 構築側はすでに
+        ; 「画面X = ワールドX - カメラX」で組んであるので、差し替えはここと
+        ; ネームテーブル更新のキューだけで済む。
         bit PPUSTATUS
         lda #0
         sta PPUSCROLL
@@ -31,7 +34,7 @@
 
         lda #(CTRL_NMI_ON | CTRL_SPR_8X16)
         sta PPUCTRL
-        lda #(MASK_SHOW_SPR | MASK_SPR_LEFT)   ; P0 は黒画面＋スプライトのみ
+        lda #(MASK_SHOW_SPR | MASK_SPR_LEFT)   ; 背景はまだ無い。スプライトのみ
         sta PPUMASK
 
         inc frame_counter

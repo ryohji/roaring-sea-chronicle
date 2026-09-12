@@ -108,4 +108,74 @@ SPR_CLASS_FAR_ENE  = 3   ; それ以外の敵、および自律仲間
 SPR_CLASS_EFFECT   = 4   ; エフェクト・UI。消えても遊びが壊れない
 SPR_CLASS_COUNT    = 5
 
+; ---- 擬似奥行きレーンの座標系 ----
+; レーン番号 0 が最も奥（画面上方）、LANE_COUNT-1 が最も手前（画面下方）。
+; レーン番号 → 画面Y の対応表は src/engine/lane.s の lane_ground_y にある（等間隔ではない）。
+LANE_FIRST = 0
+LANE_LAST  = LANE_COUNT - 1
+
+; レーン移動にかける補間フレーム数。手触りのパラメータなのでここで調整する。
+; 制約: LANE_MOVE_FRAMES + （レーン間の最大Y差）が 255 を超えないこと
+;       （lane.s の補間が 8bit の累算器を使うため）。
+LANE_MOVE_FRAMES = 8
+
+; ---- エンティティテーブル ----
+; Structure of Arrays（属性ごとに1配列）。実体と各配列のラベルは src/engine/entity.s。
+; 構造体オフセットを持たないのは `lda ent_x_lo, x` の1命令で引けるようにするため。
+;
+; 添字の区画割り。固定区画にしてあるので「プレイヤーは常に添字0」が保証される。
+; 探索なしで引けること、および ai / action がスロット範囲で走査できることを優先した。
+ENT_PLAYER      = 0                                   ; 操作キャラ（1体）
+ENT_ALLY_FIRST  = 1                                   ; 自律仲間
+ENT_ALLY_COUNT  = PARTY_SIZE - 1                      ; = 2
+ENT_ENEMY_FIRST = ENT_ALLY_FIRST + ENT_ALLY_COUNT     ; = 3
+ENT_ENEMY_COUNT = MAX_ENEMIES                         ; = 6（ADR-0002）
+ENT_FREE_FIRST  = ENT_ENEMY_FIRST + ENT_ENEMY_COUNT   ; = 9
+ENT_FREE_COUNT  = 7                                   ; 弾・エフェクトなどの共用枠
+MAX_ENTITIES    = ENT_FREE_FIRST + ENT_FREE_COUNT     ; = 16
+
+; ent_active の値。$80 にしてあるので bmi / bpl でも判定できる。
+ENT_INACTIVE = $00
+ENT_ACTIVE   = $80
+
+; ent_state の最小値。状態の語彙を増やすのは action-dev の領分（engine は箱だけ持つ）。
+ENT_ST_IDLE = 0
+
+; ---- 体格型 ----
+; ここにあるのは ID（＝表の添字）だけである。横タイル数の実値は
+; src/engine/sprite.s の body_width 表が持つ。ADR-0002 の見積表がその出典。
+; 体格型は「データ側の ID を入れる箱」であり、キャラ名や話番号を持たせてはならない。
+BODY_PLACEHOLDER = 0   ; 仮CHR用。8x16 の図形が1つしかないので1タイル幅
+BODY_LIGHT       = 1   ; 軽装・小柄
+BODY_HEAVY       = 2   ; 重装
+BODY_BEAST       = 3   ; 獣
+BODY_BEAST_LARGE = 4   ; 獣（大）
+BODY_MACHINE     = 5   ; 機械型（大型敵）
+BODY_TYPE_COUNT  = 6
+
+; ---- スプライト描画 ----
+; 8x16 スプライト前提。1体は「8x16 を横に body_width 個」で構成する。
+SPRITE_W = 8
+SPRITE_H = 16
+
+; エンティティの Y は「足元（接地線）の画面Y」である。奥行きの前後関係は
+; この値の大小で決まるので、描画の基準点を足元に置いておくと並べ替えが素直になる。
+; OAM の Y バイトは実際の表示より1ライン上にずれる仕様なので、その1も含めて引く。
+ENT_Y_TO_OAM = SPRITE_H + 1
+
+; OAM 並べ替えキーの詰め方: 上位3bit = 優先度クラス / 下位5bit = 奥行き（足元Yの粗い階調）。
+; 値が小さいほど OAM の先頭に置かれる（＝前面に描かれ、8スプライト制約で生き残る）。
+SORT_KEY_DEPTH_SHIFT = 3    ; 足元Y を 8ライン刻みに落として 0..31 にする
+SORT_KEY_DEPTH_MAX   = 31
+SORT_KEY_CLASS_SHIFT = 5
+
+; ---- 矩形（当たり判定のプリミティブ）----
+; X はワールド座標で 16bit、Y と幅・高さは 8bit。実体は zeropage の rect_a / rect_b。
+RECT_X_LO = 0
+RECT_X_HI = 1
+RECT_Y    = 2
+RECT_W    = 3
+RECT_H    = 4
+RECT_SIZE = 5
+
 .endif
