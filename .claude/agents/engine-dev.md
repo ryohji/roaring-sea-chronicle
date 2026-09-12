@@ -15,7 +15,8 @@ model: opus
 - MMC3バンク切替とバンク跨ぎ呼び出しのトランポリン
 
 ## 範囲
-- **書込可**: `src/engine/`, `src/main.s`, `src/init.s`, `src/nmi.s`, `src/zeropage.inc`, `src/constants.inc`, `cfg/`
+- **書込可**: `src/engine/`, `src/main.s`, `src/init.s`, `src/nmi.s`, `src/header.s`, `src/zeropage.inc`, `src/constants.inc`, `cfg/`
+  （iNES ヘッダとリンカスクリプトは ROM 構成そのものなので engine-dev が持つ）
 - それ以外は読取のみ
 
 ## 成功条件

@@ -48,7 +48,7 @@
 | エージェント | 書込可能範囲 |
 |---|---|
 | spec-keeper | `docs/` のみ（`src/` は読取のみ） |
-| engine-dev | `src/engine/`, `src/main.s`, `src/init.s`, `src/nmi.s`, `cfg/` |
+| engine-dev | `src/engine/`, `src/main.s`, `src/init.s`, `src/nmi.s`, `src/header.s`, `src/*.inc`, `cfg/` |
 | action-dev | `src/action/` |
 | ai-dev | `src/ai/`, `data/ai_params.tsv` |
 | campaign-dev | `src/campaign/`, `data/flags.tsv`, `data/scenario.tsv`, `data/roster.tsv` |
