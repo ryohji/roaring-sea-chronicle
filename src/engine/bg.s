@@ -9,14 +9,14 @@
 ;   * 地形を**式で生成**する（縞・床線・等間隔の柱）。表もデータファイルも持たない
 ;   * シナリオ固有の地形・プロップ・ギミックを一切書かない
 ;   * P3 で丸ごと差し替えられる前提で書く。外に出しているのは
-;     bg_fill_initial / bg_queue_column / bg_queue_attr の3つだけ
+;     bg_fill_window / bg_queue_column / bg_queue_attr の3つだけ
 ;
 ; engine が P3 以降も持ち続けるのは「列が現れたら1列ぶん転送する」という段取りであって、
 ; その1列の中身をどこから取るかは差し替え点である。
 .include "constants.inc"
 .include "zeropage.inc"
 
-.export bg_fill_initial, bg_queue_column, bg_queue_attr
+.export bg_fill_window, bg_queue_column, bg_queue_attr
 .export bg_col_lo, bg_col_hi
 
 .import vram_queue_open, vram_queue_byte, vram_queue_close
@@ -64,8 +64,14 @@ bg_col_lo:   .res 1
 bg_col_hi:   .res 1
 
 bg_row:      .res 1          ; 生成ループの行カウンタ（jsr をまたぐので自前で持つ）
-bg_tile_a:   .res 1          ; 起動時の床ループが使う交互タイル
+bg_tile_a:   .res 1          ; 一括転送の床ループが使う交互タイル
 bg_tile_b:   .res 1
+
+; 一括転送（bg_fill_window）の作業変数。bg_col_lo/hi は生成器への引数として
+; 書き換えながら使うので、張り直しの基準はこちらに控える。
+bg_base_lo:  .res 1          ; 一括で埋めるネームテーブルの先頭ワールド列（32の倍数）
+bg_base_hi:  .res 1
+bg_extra:    .res 1          ; ブロックの右に追加で書く列数
 
 .segment "CODE"
 
@@ -209,19 +215,68 @@ bg_tile_b:   .res 1
         rts
 .endproc
 
-; ---------------------------------------------------------------- 起動時の一括転送
-; 画面1枚ぶん（ネームテーブル0 の 32 列）と、その右隣の1列を書く。
-; **描画無効中に呼ぶこと**（$2007 を予算無視で叩くため）。
+; ---------------------------------------------------------------- 一括転送
+; **任意のカメラ位置から、見えている背景を丸ごと書き直す入口。**
+;   入力: bg_col_lo/hi = 画面左端のタイル列（= cam_x >> 3。32 の倍数でなくてよい）
+;   **描画無効中に呼ぶこと**（$2007 を予算無視で叩くため）。
+;   呼び出し側が守るべき手順は src/engine/scroll.s の scroll_warp_to に書いてある。
 ;
-; 2枚とも埋めないのは起動時間の都合である（ここが長引くと最初の NMI が遅れる）。
-; ネームテーブル1 の残りは、カメラが右へ動くにつれて転送キューが1列ずつ埋める。
-; カメラの左端は 0 でクランプされるので、左へはみ出した列を見ることはない。
-; 右端の1列（列32）だけは、カメラが1ドット動いた瞬間に見えてしまい、
-; 列の刻み（8ドット）では間に合わないので、ここで先に書いておく。
+; 書くのは可視 33 列（画面の 32 列＋右端にはみ出す1列）である。2枚のネームテーブルを
+; 丸ごと埋めないのは起動時間の都合で、起動もこの入口を通るためである
+; （ここが長引くと最初の NMI が遅れる。run_tests.py の BOOT_FRAMES_MAX を見よ）。
+; 見えていない列は、カメラが動くにつれて転送キューが1列ずつ埋める。
 ;
+; 段取りは2つに分かれる:
+;   1. 左端の列を含む「32 列ブロック」（= ネームテーブル1枚ぶん）を行単位で一括に書く
+;   2. その右隣から (列 & 31) + 1 列を、1列ずつ書く
+; ブロックの先頭は必ず 32 の倍数なので、柱の周期 (8) も床の市松 (2) も位相が
+; 列0 と揃う。だから 1 の一括ループは列番号を見ずに書ける。
+.proc bg_fill_window
+        ; --- 追加で書く列数 = (列 & 31) + 1 ---
+        ; ブロックが覆うのは 列 .. ブロック先頭+31。可視列は 列 .. 列+32 なので、
+        ; はみ出すのは (列 - ブロック先頭) + 1 列である。左端が列の境界に乗っていても
+        ; 1 列は必ずはみ出す（可視列が 33 列であることの言い換え）。
+        lda bg_col_lo
+        and #(SCREEN_TILES_W - 1)
+        clc
+        adc #1
+        sta bg_extra
+
+        lda bg_col_lo                    ; ブロック先頭 = 列 & ~31
+        and #<(256 - SCREEN_TILES_W)
+        sta bg_base_lo
+        lda bg_col_hi
+        sta bg_base_hi
+        jsr bg_fill_block
+
+        ; --- ブロックの右隣から bg_extra 列 ---
+        lda bg_base_lo
+        clc
+        adc #SCREEN_TILES_W
+        sta bg_col_lo
+        lda bg_base_hi
+        adc #0
+        sta bg_col_hi
+@extra:
+        jsr bg_write_column_now
+        lda bg_col_lo                    ; 属性列の左端に来たら、その属性列も書く。
+        and #(ATTR_TILES - 1)            ; 追加列は 32 の倍数から始まるので、
+        bne @next                        ; 触れる属性列の左端は必ずこの範囲に入る
+        jsr bg_write_attr_now
+@next:
+        inc bg_col_lo
+        bne :+
+        inc bg_col_hi
+:       dec bg_extra
+        bne @extra
+        rts
+.endproc
+
+; bg_base_lo/hi（32 の倍数）から 32 列ぶん＝ネームテーブル1枚を一括で書く。
 ; 1セルずつ生成すると起動時間に響くので、ここだけは行ごとに帯を判定して、
 ; その帯専用のループで 32 バイトを流す。生成規則は bg_tile_at と同じものである。
-.proc bg_fill_initial
+.assert (SCREEN_TILES_W .MOD (BG_PILLAR_MASK + 1)) = 0, error, "柱の周期がブロック幅を割り切らない"
+.proc bg_fill_block
         ; ここで PPUCTRL に NMI 許可ビットを書いてはならない。
         ; NMI は sei では止まらないので、立てた瞬間にハンドラが走り、
         ; この転送の途中で PPUADDR を奪われて画面が壊れる。
@@ -229,10 +284,16 @@ bg_tile_b:   .res 1
         lda ppu_ctrl_shadow
         and #CTRL_NMI_OFF
         sta PPUCTRL                      ; アドレス加算は +1（行方向に流す）
+
+        lda bg_base_lo                   ; 先頭列のアドレス = そのネームテーブルの原点
+        sta bg_col_lo
+        lda bg_base_hi
+        sta bg_col_hi
+        jsr bg_column_addr
         bit PPUSTATUS
-        lda #>NT_BASE
+        lda vq_dst_hi
         sta PPUADDR
-        lda #<NT_BASE
+        lda vq_dst_lo
         sta PPUADDR
 
         ldx #0                           ; X = 行
@@ -301,11 +362,15 @@ bg_tile_b:   .res 1
         beq @attr
         jmp @row
 
-        ; --- ネームテーブル0 の属性テーブル 64 バイト ---
+        ; --- このネームテーブルの属性テーブル 64 バイト ---
 @attr:
-        lda #>(NT_BASE + NT_ATTR_OFFSET)
+        lda bg_base_lo
+        sta bg_col_lo
+        jsr bg_attr_addr                 ; 先頭列の属性 = 属性テーブルの原点
+        bit PPUSTATUS
+        lda vq_dst_hi
         sta PPUADDR
-        lda #<(NT_BASE + NT_ATTR_OFFSET)
+        lda vq_dst_lo
         sta PPUADDR
         ldx #0                           ; X = 属性テーブルの通し番号
 @attr_loop:
@@ -313,7 +378,9 @@ bg_tile_b:   .res 1
         and #(ATTR_COLS - 1)             ; 属性列
         asl a
         asl a                            ; 属性列 → タイル列（模様の周期に合わせる）
-        sta bg_col_lo
+        clc
+        adc bg_base_lo                   ; ブロック先頭を足してワールド列に直す
+        sta bg_col_lo                    ; （模様は列で決まる。仮背景は下位しか見ない）
         stx bg_row
         jsr bg_attr_byte
         sta PPUDATA
@@ -321,14 +388,7 @@ bg_tile_b:   .res 1
         inx
         cpx #(ATTR_COLS * ATTR_ROWS)
         bne @attr_loop
-
-        ; --- 画面の右隣の1列（列32 = ネームテーブル1 の第0列）と、その属性列 ---
-        lda #SCREEN_TILES_W
-        sta bg_col_lo
-        lda #0
-        sta bg_col_hi
-        jsr bg_write_column_now
-        jmp bg_write_attr_now
+        rts
 .endproc
 
 ; bg_col_lo の列を、キューを通さずその場で書く。**描画無効中専用**。

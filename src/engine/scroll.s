@@ -13,12 +13,12 @@
 .include "constants.inc"
 .include "zeropage.inc"
 
-.export scroll_init, cam_update, cam_set_stage_width
+.export scroll_init, cam_update, cam_set_stage_width, cam_publish, scroll_warp_to
 .export cam_limit_lo, cam_limit_hi, stage_w_lo, stage_w_hi
 
 .import ent_x_lo, ent_x_hi
 .import bg_col_lo, bg_col_hi, bg_queue_column, bg_queue_attr
-.import bg_fill_initial
+.import bg_fill_window
 .import vram_queue_reset
 
 ; P1 の暫定ステージ長。**この値に意味は無い**。
@@ -35,21 +35,108 @@ stage_w_hi:   .res 1
 
 .segment "CODE"
 
-; 起動時に1回呼ぶ。カメラを原点に置き、画面1枚ぶんの背景を書く。
-; **描画無効中に呼ぶこと**（bg_fill_initial が $2007 を予算無視で叩く）。
+; 起動時に1回呼ぶ。カメラを原点に置き、そこから見える背景を書く。
+; **描画無効中に呼ぶこと**（scroll_warp_to が $2007 を予算無視で叩く）。
+; 中身は「カメラ位置 0 への飛び込み」でしかない。列0固定の初期化を別に持たない。
 .proc scroll_init
-        lda #0
-        sta cam_x_lo
-        sta cam_x_hi
-        sta cam_col_lo
-        sta cam_col_hi
-        jsr vram_queue_reset
-
         lda #<SCROLL_TEST_STAGE_W
         ldx #>SCROLL_TEST_STAGE_W
-        jsr cam_set_stage_width
+        jsr cam_set_stage_width          ; 上限を先に決める（warp がここでクランプする）
 
-        jmp bg_fill_initial
+        lda #0
+        ldx #0
+        jmp scroll_warp_to
+.endproc
+
+; ---------------------------------------------------------------- 飛び込み
+; カメラを**任意の位置へ飛ばし、そこから見える背景を丸ごと張り直す**。
+;   入力: A = 新しい cam_x 下位, X = 同 上位（ステージの上限でクランプする）
+;
+; 1フレームに転送できるのは1列ぶんなので、カメラが大きく飛んだときに
+; 通常の列追跡（scroll_track_columns）で追いつかせると、96列飛べば 96 フレーム＝
+; 1.6 秒のあいだ誤った背景が出続ける。飛ばすなら背景は一括で書き直すしかない。
+;
+; 想定する使い手:
+;   * ADR-0001 のオートセーブ復帰（ステージ途中の cam_x から再開） … P4 campaign-dev
+;   * シーン転換・大きなノックバック                              … P3 以降
+; **セーブ側の処理は engine の担当ではない。ここは入口を用意するだけである。**
+;
+; 呼び出し側の手順（**描画無効中に呼ぶこと**。$2007 を予算無視で叩く）:
+;   1. 描画を止める。ppu_mask_shadow に 0 を入れてから PPUMASK に書くこと。
+;      NMI は sei では止まらないので、シャドウを直さずに PPUMASK だけ 0 にしても
+;      次の NMI がシャドウを読んで描画を戻してしまう。
+;   2. scroll_warp_to を呼ぶ（転送キューは中で空にする。積んであった古い列の記録は
+;      張り直した絵を上書きしてしまうので捨てるのが正しい）。
+;   3. 呼んだあとに復元するもの:
+;        - oam_build を呼び直す（画面X = ワールドX - カメラX が全部変わっている）
+;        - ppu_mask_shadow を元に戻す
+;        - bit PPUSTATUS のあと PPUCTRL / PPUSCROLL / PPUMASK をシャドウから置き直す
+;          （$2006 を叩いたので PPU の内部アドレスが壊れている。置き直さないと
+;           最初の1フレームが流れて見える）
+;   なお 1 と 3 は VBlank の中で行うこと。描画期間中に PPUMASK を切ると画面が乱れる。
+;
+; 費用（実測）: カメラが列の境界に乗っているとき約 17900 サイクル（0.6 フレーム）、
+; 最悪（左端が 32 列ブロックの右端にあるとき）約 76500 サイクル（2.6 フレーム）。
+; そのあいだ画面は黒いままである。転換の演出（暗転）の裏に隠せる長さだが、
+; 「一瞬で切り替わる」ようには見えないことを織り込んで呼ぶこと。
+.proc scroll_warp_to
+        sta cam_x_lo
+        stx cam_x_hi
+
+        ; ステージの右端でクランプする（左端は 0 で、16bit の下限なので自明）。
+        lda cam_limit_hi
+        cmp cam_x_hi
+        bcc @clamp
+        bne @in_range
+        lda cam_limit_lo
+        cmp cam_x_lo
+        bcs @in_range
+@clamp:
+        lda cam_limit_lo
+        sta cam_x_lo
+        lda cam_limit_hi
+        sta cam_x_hi
+@in_range:
+        jsr vram_queue_reset
+
+        ; 列追跡の状態も一緒に初期化する。ここを置き直さないと、張り直した直後に
+        ; 「古い cam_col から新しい cam_col まで」の列が延々と積み直され、
+        ; せっかく書いた絵の上に同じ絵を数十フレームかけて書き戻すことになる。
+        jsr cam_x_to_col
+        lda tmp0
+        sta cam_col_lo
+        sta bg_col_lo
+        lda tmp1
+        sta cam_col_hi
+        sta bg_col_hi
+        jsr bg_fill_window
+        jmp cam_publish                  ; NMI に見せる値も新しいカメラに合わせる
+.endproc
+
+; ---------------------------------------------------------------- 公開
+; cam_x を NMI に見せる。**1フレームに1回、カメラを動かし終えてから呼ぶこと。**
+;
+; なぜこの形なら競合しないか:
+;   * NMI が読むのは cam_pub_lo/hi の「cam_pub_sel が指す面」だけである。
+;   * ここで書くのは **NMI が読んでいない方の面** なので、書いている最中に NMI が
+;     入っても、NMI は触られていない面（＝前フレームの完全な組）を読む。
+;   * 面を切り替えるのは最後の stx cam_pub_sel **1命令**である。6502 の命令は
+;     NMI に途中で割られないので、NMI から見た cam_pub_sel は切り替えの前か後の
+;     どちらかしかない。中途半端な lo/hi の組を読む窓が存在しない。
+;   * したがって「メインが更新中にフレームが来たら前フレームの値を使う」が
+;     自動的に成り立つ。1フレーム古い値で描くことはあっても、画面は飛ばない。
+; 順序の要件: lo と hi を書き終える**前に** cam_pub_sel を書いてはならない。
+; 逆にすると、書きかけの面を NMI に見せることになり、対策の意味が消える。
+.proc cam_publish
+        lda cam_pub_sel
+        eor #1
+        tax                              ; X = いま NMI が読んでいない面
+        lda cam_x_lo
+        sta cam_pub_lo, x
+        lda cam_x_hi
+        sta cam_pub_hi, x
+        stx cam_pub_sel                  ; ★ ここで初めて新しい組が見える
+        rts
 .endproc
 
 ; ステージの横幅（ドット）からカメラの上限を決める。
@@ -73,10 +160,15 @@ stage_w_hi:   .res 1
 .endproc
 
 ; 毎フレーム1回、メインループから呼ぶ（NMI からではない）。
-; 操作キャラを不感帯つきで追い、新しく見えるようになった列を転送キューに積む。
+; 操作キャラを不感帯つきで追い、新しく見えるようになった列を転送キューに積み、
+; 最後に **cam_publish で NMI に見せる**。
+; 公開をここに畳んであるのは、呼び忘れると「NMI が1フレーム古いカメラを出し続ける」
+; という気付きにくい壊れ方をするためである。カメラを動かす入口はここと
+; scroll_warp_to の2つだけにし、どちらも最後に公開する。
 .proc cam_update
         jsr cam_follow_player
-        jmp scroll_track_columns
+        jsr scroll_track_columns
+        jmp cam_publish
 .endproc
 
 ; ---------------------------------------------------------------- 追従
@@ -158,6 +250,22 @@ stage_w_hi:   .res 1
         rts
 .endproc
 
+; カメラの左端が乗っているタイル列を tmp0/tmp1 に置く（= cam_x >> TILE_W_SHIFT）。
+; 列追跡と飛び込みの両方が使う。
+.proc cam_x_to_col
+        lda cam_x_hi
+        lsr a
+        sta tmp1
+        lda cam_x_lo
+        ror a
+        lsr tmp1
+        ror a
+        lsr tmp1
+        ror a
+        sta tmp0
+        rts
+.endproc
+
 ; ---------------------------------------------------------------- 列の追跡
 ; カメラの左端タイル列 (cam_x >> 3) が変わったら、新しく見えるようになった列を積む。
 ;
@@ -172,16 +280,7 @@ stage_w_hi:   .res 1
 ;
 ; tmp0/tmp1 = カメラの新しい列、tmp2/tmp3 = 積む列。
 .proc scroll_track_columns
-        lda cam_x_hi                     ; 新しい列 = cam_x >> TILE_W_SHIFT
-        lsr a
-        sta tmp1
-        lda cam_x_lo
-        ror a
-        lsr tmp1
-        ror a
-        lsr tmp1
-        ror a
-        sta tmp0
+        jsr cam_x_to_col                 ; tmp0/tmp1 = cam_x >> TILE_W_SHIFT
 
 @loop:
         lda tmp0                         ; 追いついたら終わり

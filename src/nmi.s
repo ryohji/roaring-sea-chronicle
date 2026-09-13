@@ -46,12 +46,21 @@
         ; --- スクロール設定 ---
         ; ネームテーブルは左右に2枚（垂直ミラーリング）。カメラX の bit8 が
         ; そのままベースネームテーブルの選択ビットになる。
+        ;
+        ; **cam_x_lo/hi を直接読んではならない。** メインは 16bit のカメラを
+        ; 2命令に分けて書くので、その隙に NMI が入ると lo が新・hi が旧の組を読み、
+        ; 256ドット境界をまたぐ瞬間だけ画面が1画面ぶん飛ぶ。読むのは公開コピーである。
+        ;
+        ; 順序の要件: 添字 cam_pub_sel は**1回だけ**読んで X に取り、lo と hi を
+        ; 同じ X で引くこと。lo と hi で読み直すと、その間にメインが面を切り替えたときに
+        ; 別々の面から1バイトずつ拾う——つまり直そうとしている不整合そのものが戻る。
         bit PPUSTATUS                    ; $2005/$2006 の書き込みラッチを倒しておく
-        lda cam_x_hi
+        ldx cam_pub_sel                  ; ここ1箇所でだけ面を決める
+        lda cam_pub_hi, x
         and #CTRL_NT_X
         ora ppu_ctrl_shadow
         sta PPUCTRL
-        lda cam_x_lo
+        lda cam_pub_lo, x
         sta PPUSCROLL                    ; 横
         lda #0
         sta PPUSCROLL                    ; 縦（横スクロール専用なので常に 0）

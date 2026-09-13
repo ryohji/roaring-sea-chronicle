@@ -23,6 +23,11 @@ cam_x_hi:      .res 1
 cam_col_lo:    .res 1
 cam_col_hi:    .res 1
 
+; 公開コピーは面0/面1 の 2 バイト配列。添字 (cam_pub_sel) で引くので連続していること。
+cam_pub_lo:    .res 2
+cam_pub_hi:    .res 2
+cam_pub_sel:   .res 1
+
 vq_head:       .res 1
 vq_tail:       .res 1
 vq_wr:         .res 1

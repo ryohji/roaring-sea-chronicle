@@ -68,14 +68,15 @@
         ; （NMI も、ステータスバー分割の IRQ も、このシャドウを読んで書く）。
         ;   背景パターンテーブルは $1000 側。スプライトは 8x16 モードなので
         ;   タイル番号の bit0 がパターンテーブルを選ぶ（PPUCTRL bit3 は効かない）。
-        ;   ネームテーブル選択ビットは 0 のままにしておくこと。NMI が cam_x から載せる。
+        ;   ネームテーブル選択ビットは 0 のままにしておくこと。
+;   NMI がカメラの公開コピー (cam_pub_hi) から毎フレーム載せる。
         lda #(CTRL_NMI_ON | CTRL_SPR_8X16 | CTRL_BG_1000 | CTRL_INC_1)
         sta ppu_ctrl_shadow
         lda #(MASK_SHOW_BG | MASK_SHOW_SPR | MASK_BG_LEFT | MASK_SPR_LEFT)
         sta ppu_mask_shadow
 
         jsr load_palette
-        jsr scroll_init          ; カメラを原点に置き、画面1枚ぶんの仮背景を書く
+        jsr scroll_init          ; カメラを原点に置き、そこから見える仮背景を書く
         rts
 .endproc
 

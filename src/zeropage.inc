@@ -16,12 +16,25 @@ ZEROPAGE_INC = 1
 ; MMC3 スキャンライン IRQ を入れると IRQ 側もこれらを触るため、
 ; 「最後に誰が何を書いたか」が一箇所で分かる形にしておかないと競合する。
 ;   ppu_ctrl_shadow のネームテーブル選択ビット (bit0) は常に 0 にしておくこと。
-;   NMI が cam_x から毎フレーム計算して ora で載せる。
+;   NMI がカメラの公開コピー (cam_pub_hi) から毎フレーム計算して ora で載せる。
 .globalzp ppu_ctrl_shadow, ppu_mask_shadow
 
 ; --- カメラ（横スクロールの原点）---
 ; 画面X = ワールドX - カメラX。操作キャラを不感帯つきで追う（src/engine/scroll.s）。
+; **これを書いてよいのはメインループだけ。NMI はここを読んではならない**（下記）。
 .globalzp cam_x_lo, cam_x_hi
+; NMI に見せるカメラの公開コピー（二面）。
+; cam_x は 16bit なので、メインは lo と hi を別々の命令で書く。その2命令の間に
+; NMI が入ると「新しい lo と古い hi」の組が画面に出る。cam_x_hi はネームテーブル
+; 選択ビットなので、**256ドット境界をまたぐ瞬間だけ画面が丸1画面ぶん飛ぶ**。
+; sei では NMI は止まらないので、割り込み禁止では防げない。
+; そこで二面を持ち、NMI が読んでいない側に組み立ててから、添字 cam_pub_sel を
+; **1命令で**差し替える（src/engine/scroll.s の cam_publish）。
+; 6502 の命令は NMI に中断されないので、NMI が見る添字は必ず切り替えの前か後であり、
+; どちらの面も「完全に書き終えた組」である。
+;   書くのは cam_publish だけ / 読むのは NMI だけ。
+.globalzp cam_pub_lo, cam_pub_hi   ; 面0 / 面1 の 2 バイト配列
+.globalzp cam_pub_sel              ; NMI が読む面の添字 (0 or 1)
 ; カメラの左端が今どのタイル列にあるか（= cam_x >> 3）。
 ; 新しい列が見えるようになったことは、この値の変化で検出する。
 .globalzp cam_col_lo, cam_col_hi

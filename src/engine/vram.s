@@ -28,7 +28,7 @@
 
 .export vram_queue_reset, vram_queue_open, vram_queue_byte, vram_queue_close
 .export vram_queue_flush, vram_queue_pending
-.export vq_dst_lo, vq_dst_hi, vq_overflow
+.export vq_dst_lo, vq_dst_hi, vq_overflow, vq_badstep
 
 .segment "BSS"
 
@@ -41,6 +41,8 @@ vq_dst_hi:   .res 1
 vq_arg_len:  .res 1          ; 同: データ長（open が控える）
 vq_arg_flags: .res 1         ; 同: フラグ
 vq_overflow: .res 1          ; 空きが無くて積めなかった回数（デバッグと予算の当たりを見る用）
+vq_badstep:  .res 1          ; ページ境界をまたぐ STEP 記録を突き返した回数（下記）
+vq_span:     .res 1          ; その検査の作業用（tmp0-3 は呼び出し元が握っているので使えない）
 
 .segment "CODE"
 
@@ -51,6 +53,7 @@ vq_overflow: .res 1          ; 空きが無くて積めなかった回数（デ�
         sta vq_tail
         sta vq_wr
         sta vq_overflow
+        sta vq_badstep
         rts
 .endproc
 
@@ -65,11 +68,40 @@ vq_overflow: .res 1          ; 空きが無くて積めなかった回数（デ�
 ; 記録を1つ開く。
 ;   入力: vq_dst_lo/hi = 転送先 VRAM アドレス、X = データ長、A = フラグ
 ;   出力: C=0 成功（続けて vram_queue_byte を X 回、最後に vram_queue_close）
-;         C=1 空き不足（何も積んでいない。呼び出し側は次フレームに回すこと）
+;         C=1 積めなかった（何も積んでいない）。理由は2つあり、カウンタで区別できる:
+;             vq_overflow が増えた … 空き不足。**次フレームに回せば通る**
+;             vq_badstep  が増えた … 記録そのものが不正。**何度積み直しても通らない**
 ;   壊す: A, X
 .proc vram_queue_open
         stx vq_arg_len
         sta vq_arg_flags
+
+        ; --- STEP 記録がページ境界をまたがないことを確かめる ---
+        ; STEP 形式は転送先アドレスの**下位だけ**を増分で進める（vram_queue_flush）。
+        ; 上位まで繰り上げないので、下位が桁上がりすると巻き取って**同じページの先頭**へ
+        ; 書き込む。属性を書いたつもりがネームテーブルの上段を潰す、という壊れ方をする。
+        ; 転送先が化けるだけなので、症状から原因までが遠い。
+        ;
+        ; 前提はコメントに書くだけにせず、破れたら積む側が気付ける形にしておく。
+        ; ここはメインループ（描画期間中）なので、VBlank の予算には1サイクルも効かない。
+        ; 属性列（$23C0..$23F8）はそもそも成立しており、それは constants.inc の
+        ; .assert がリンク時に縛っている。この実行時検査が効くのは、P7 のテキスト
+        ; ウィンドウなど**あとから STEP を使う側**である。
+        lda vq_arg_flags
+        bpl @span_ok                     ; RUN 形式は PPU が 16bit で加算するので無関係
+        and #VQ_STEP_MASK
+        sta vq_span
+        ldx vq_arg_len
+        dex
+        beq @span_ok                     ; 1バイトならアドレスは進まない
+        lda vq_dst_lo
+@span:
+        clc
+        adc vq_span
+        bcs @bad_step                    ; 桁上がり = ページをまたいだ
+        dex
+        bne @span
+@span_ok:
 
         ; 積んだ後の使用量が 255 を超えないこと。
         ; 256 ちょうどにすると tail == head になり「空」と区別がつかなくなる。
@@ -100,6 +132,12 @@ vq_overflow: .res 1          ; 空きが無くて積めなかった回数（デ�
         rts
 @full:
         inc vq_overflow
+        sec
+        rts
+; 積む側の間違い。黙って別の場所を壊すよりは、転送しないで数える方がよい。
+; vq_badstep が 0 でなければ、記録を作った側が STEP の増分か長さを間違えている。
+@bad_step:
+        inc vq_badstep
         sec
         rts
 .endproc
@@ -204,6 +242,9 @@ vq_overflow: .res 1          ; 空きが無くて積めなかった回数（デ�
         ; 属性テーブルの縦1列は 8 バイトおきで、PPU の自動加算（1 か 32）では届かない。
         ; 高くつくので、費用の重みを 3 にして予算で抑えてある。
         ; 前提: 増分を足してもアドレス下位が桁上がりしないこと（属性1列は $23C0..$23F8 に収まる）。
+        ; **この前提は vram_queue_open が積む時点で検査済みである**（またぐ記録は積まれない）。
+        ; ここで繰り上げを見ないのは、1バイトごとに数サイクル増えるのが VBlank に効くからで、
+        ; 手を抜いているのではない。検査は予算の外（メインループ）に置いてある。
 @step_mode:
         and #VQ_STEP_MASK
         sta vq_step

@@ -151,6 +151,13 @@ VQ_STEP_ATTR = VQ_STEP | ATTR_COLS       ; = STEP 増分 8
 .assert VQ_MAX_LEN <= VQ_COST_BUDGET, error, "1記録が1フレームの予算に収まらない（永久に処理されない）"
 .assert SCREEN_TILES_H <= VQ_MAX_LEN, error, "ネームテーブル1列が1記録に収まらない"
 
+; STEP 形式は転送先アドレスの**下位だけ**を進める（上位へ繰り上げない）。
+; 1記録がページ境界をまたぐと、下位が巻き取って同じページの先頭を黙って壊す。
+; いまの唯一の利用者である属性列を、ここでリンク時に縛っておく。
+; 属性列の転送先下位は最大 (<NT_ATTR_OFFSET) + (ATTR_COLS-1) から始まり、
+; 増分 ATTR_COLS を (ATTR_ROWS-1) 回足す。$23C0..$23F8 に収まっていること。
+.assert (<NT_ATTR_OFFSET) + (ATTR_COLS - 1) + ATTR_COLS * (ATTR_ROWS - 1) <= $FF, error, "属性列の STEP 転送がページ境界をまたぐ（転送先が別のページに化ける）"
+
 ; ---- ゲーム基本定数 ----
 ; レーン数は4に固定。ADR なしに変更してはならない（CLAUDE.md 第5条）。
 LANE_COUNT = 4
