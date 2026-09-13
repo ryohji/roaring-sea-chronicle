@@ -42,7 +42,8 @@ ZEROPAGE_INC = 1
 ; --- VRAM 転送キュー（src/engine/vram.s）---
 ; メインループが積み、NMI が予算のぶんだけ刻んで転送する。
 ; 書き手が分かれているので、どちらか片方しか書かない変数に分けてある。
-.globalzp vq_head            ; NMI が次に読む位置（NMI だけが書く）
+.globalzp vq_head            ; NMI が次に読む位置（進めるのは NMI。メインは
+                             ; vram_queue_reset で空にするときだけ書く。理由は vram.s）
 .globalzp vq_tail            ; 確定した記録の末尾（メインだけが書く。ここが公開の境界）
 .globalzp vq_wr              ; 組み立て中の書き込み位置（メインだけが使う）
 ; 以下は **NMI 専用**の作業変数。メインループから触ってはならない。
