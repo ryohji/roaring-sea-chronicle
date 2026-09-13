@@ -15,6 +15,7 @@
 
 .export scroll_init, cam_update, cam_set_stage_width, cam_publish, scroll_warp_to
 .export cam_limit_lo, cam_limit_hi, stage_w_lo, stage_w_hi
+.export scroll_warp_live
 
 .import ent_x_lo, ent_x_hi
 .import bg_col_lo, bg_col_hi, bg_queue_column, bg_queue_attr
@@ -32,6 +33,9 @@ cam_limit_lo: .res 1         ; カメラX の上限（= ステージ幅 - 画面
 cam_limit_hi: .res 1
 stage_w_lo:   .res 1         ; ステージの横幅（ドット）。移動の左右限界としても使う
 stage_w_hi:   .res 1
+
+; scroll_warp_to を**描画有効のまま**呼ばれた回数（下記）。0 でなければ呼び出し側の手順違反。
+scroll_warp_live: .res 1
 
 .segment "CODE"
 
@@ -75,6 +79,9 @@ stage_w_hi:   .res 1
 ;           最初の1フレームが流れて見える）
 ;   なお 1 と 3 は VBlank の中で行うこと。描画期間中に PPUMASK を切ると画面が乱れる。
 ;
+; 手順 1 を飛ばして呼ばれた回数は scroll_warp_live に出る（ppu_mask_shadow で見ている）。
+; 0 でなければ、どこかが描画したまま背景を張り直している。
+;
 ; 費用（実測）: カメラが列の境界に乗っているとき約 17900 サイクル（0.6 フレーム）、
 ; 最悪（左端が 32 列ブロックの右端にあるとき）約 76500 サイクル（2.6 フレーム）。
 ; そのあいだ画面は黒いままである。転換の演出（暗転）の裏に隠せる長さだが、
@@ -82,6 +89,20 @@ stage_w_hi:   .res 1
 .proc scroll_warp_to
         sta cam_x_lo
         stx cam_x_hi
+
+        ; --- 「描画無効中に呼ぶこと」が守られているかを数える ---
+        ; これまでこの前提は呼び出し側の約束でしかなく、破っても何も起きなかった。
+        ; 破ったときに起きるのは「bg_fill_window が $2007 を予算無視で数万サイクルぶん
+        ; 叩く」ことであり、描画中なら画面が丸ごと壊れる。壊れ方が派手なわりに
+        ; 原因（呼ぶ場所を間違えた）までが遠いので、目盛りを置く。
+        ; 止めはしない。ここで引き返すと背景が張り直されないまま先へ進み、
+        ; 「絵が古いまま」という別の壊れ方に化けるだけである。
+        ; 費用は1回の warp あたり 8 サイクル（warp 自体が数万サイクルかかる）。
+        lda ppu_mask_shadow
+        and #(MASK_SHOW_BG | MASK_SHOW_SPR)
+        beq @blanked
+        inc scroll_warp_live
+@blanked:
 
         ; ステージの右端でクランプする（左端は 0 で、16bit の下限なので自明）。
         lda cam_limit_hi

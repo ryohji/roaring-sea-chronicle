@@ -72,11 +72,19 @@
 ;   NMI がカメラの公開コピー (cam_pub_hi) から毎フレーム載せる。
         lda #(CTRL_NMI_ON | CTRL_SPR_8X16 | CTRL_BG_1000 | CTRL_INC_1)
         sta ppu_ctrl_shadow
-        lda #(MASK_SHOW_BG | MASK_SHOW_SPR | MASK_BG_LEFT | MASK_SPR_LEFT)
-        sta ppu_mask_shadow
 
         jsr load_palette
         jsr scroll_init          ; カメラを原点に置き、そこから見える仮背景を書く
+
+        ; PPUMASK のシャドウは**初期転送が終わってから**置く。
+        ; ここまでは実機の描画も無効（$2001 に 0 を書いたまま）なので、
+        ; シャドウが 0 のままである方が実物と合う。合わせておくと
+        ; 「描画中に scroll_warp_to を呼んでいないか」をシャドウで見張れる
+        ; （src/engine/scroll.s の scroll_warp_live）。先に置くと、起動の
+        ; 初期転送そのものが毎回1件計上されて目盛りが使いものにならない。
+        ; 実際に $2001 へ書くのは reset_handler（描画開始）と NMI である。
+        lda #(MASK_SHOW_BG | MASK_SHOW_SPR | MASK_BG_LEFT | MASK_SPR_LEFT)
+        sta ppu_mask_shadow
         rts
 .endproc
 

@@ -28,7 +28,7 @@
 
 .export vram_queue_reset, vram_queue_open, vram_queue_byte, vram_queue_close
 .export vram_queue_flush, vram_queue_pending
-.export vq_dst_lo, vq_dst_hi, vq_overflow, vq_badstep
+.export vq_dst_lo, vq_dst_hi, vq_overflow, vq_badstep, vq_badlen, vq_badclose
 
 .segment "BSS"
 
@@ -42,18 +42,34 @@ vq_arg_len:  .res 1          ; 同: データ長（open が控える）
 vq_arg_flags: .res 1         ; 同: フラグ
 vq_overflow: .res 1          ; 空きが無くて積めなかった回数（デバッグと予算の当たりを見る用）
 vq_badstep:  .res 1          ; ページ境界をまたぐ STEP 記録を突き返した回数（下記）
+vq_badlen:   .res 1          ; 記録長が 1..VQ_MAX_LEN の外だったので突き返した回数
+vq_badclose: .res 1          ; 書いたバイト数が open で申告した長さと違ったので捨てた回数
 vq_span:     .res 1          ; その検査の作業用（tmp0-3 は呼び出し元が握っているので使えない）
 
 .segment "CODE"
 
 ; キューを空にする。シーン切り替えなど、積んだものを捨ててよい場面でだけ呼ぶこと。
+;
+; **注意（未解決）**: head と tail を別々に 0 に落とすので、その2命令の隙に NMI が
+; 入ると head=0 / tail=旧 という組が見える。NMI はバッファ先頭に残っているデータを
+; 記録のヘッダとして読むことになる。head := tail なら1命令で空にできて安全だが、
+; 「reset 後は先頭が添字 0」を前提にしている検証があるため、engine 側だけでは直せない。
+; 主に報告済み。**この関数を新しい場所から呼ぶ前に決着させること。**
+;
+; **不具合のカウンタ（vq_badstep / vq_badlen / vq_badclose）はここで消さない。**
+; scroll_warp_to が中で reset を呼ぶので、シーン転換やオートセーブ復帰のたびに
+; 消えてしまうと、「何度積み直しても通らない」という**まさに拾いたい不具合**が
+; 場面の切り替わりで見えなくなる。消すのは診断を読む側の仕事である。
+;
+; vq_overflow だけは消す。あれは不具合の数ではなく**混み具合の目盛り**であり
+; （空き不足。次フレームに回せば通る）、意味を持つのはひと続きの場面の中だけである。
+; 場面をまたいで積み上げると、どの場面で転送が詰まったのかが読めなくなる。
 .proc vram_queue_reset
         lda #0
         sta vq_head
         sta vq_tail
         sta vq_wr
         sta vq_overflow
-        sta vq_badstep
         rts
 .endproc
 
@@ -68,13 +84,28 @@ vq_span:     .res 1          ; その検査の作業用（tmp0-3 は呼び出し
 ; 記録を1つ開く。
 ;   入力: vq_dst_lo/hi = 転送先 VRAM アドレス、X = データ長、A = フラグ
 ;   出力: C=0 成功（続けて vram_queue_byte を X 回、最後に vram_queue_close）
-;         C=1 積めなかった（何も積んでいない）。理由は2つあり、カウンタで区別できる:
+;         C=1 積めなかった（何も積んでいない）。理由は3つあり、カウンタで区別できる:
 ;             vq_overflow が増えた … 空き不足。**次フレームに回せば通る**
 ;             vq_badstep  が増えた … 記録そのものが不正。**何度積み直しても通らない**
+;             vq_badlen   が増えた … 記録長が範囲外。同上
 ;   壊す: A, X
 .proc vram_queue_open
         stx vq_arg_len
         sta vq_arg_flags
+
+        ; --- 記録長が 1..VQ_MAX_LEN に収まっていることを確かめる ---
+        ; 長さ 0 を通すと、flush の `ldy vq_n` が 0 のまま 256 回まわり、
+        ; $2007 に 256 バイト流れる（費用の計算上は 0 なので予算では止まらない）。
+        ; 転送先はその記録のヘッダが指す先なので、どこが壊れるかは運任せになる。
+        ;
+        ; ここはメインループ（描画期間中）なので VBlank の予算には1サイクルも効かない。
+        ;
+        ; **上限（len > VQ_MAX_LEN）はまだ塞いでいない。** 塞ぐと
+        ; test/l2_scroll.py の _measure_cost_budget が落ちる（200 バイトの記録を
+        ; わざと積んで「予算で刻まれているか」を測る作りになっているため、
+        ; 突き返すと「1回で全部流れた」と同じ観測になる）。qa-runner に依頼済み。
+        cpx #1
+        bcc @bad_len                     ; 長さ 0
 
         ; --- STEP 記録がページ境界をまたがないことを確かめる ---
         ; STEP 形式は転送先アドレスの**下位だけ**を増分で進める（vram_queue_flush）。
@@ -140,6 +171,11 @@ vq_span:     .res 1          ; その検査の作業用（tmp0-3 は呼び出し
         inc vq_badstep
         sec
         rts
+; 同上。長さの申告がそもそも成立していない。
+@bad_len:
+        inc vq_badlen
+        sec
+        rts
 .endproc
 
 ; 開いている記録にデータを1バイト足す。A = データ。壊す: X
@@ -152,9 +188,41 @@ vq_span:     .res 1          ; その検査の作業用（tmp0-3 は呼び出し
 .endproc
 
 ; 記録を確定する。この1バイトの書き込みで初めて NMI から見えるようになる。
+;   出力: C=0 確定した / C=1 突き返した（vq_badclose が増える。何も確定していない）
+;
+; **確定の前に「open で申告した長さちょうど書いたか」を確かめる。**
+; vq_tail から vq_wr までの距離は「ヘッダ4バイト + 書いたデータ」でなければならない。
+; ここが合わないまま vq_tail を進めると、NMI 側の記録の連なりが**ずれる**。
+; ずれた head は次の記録のヘッダではなく**データの途中**を指し、タイル番号を
+; 長さ・アドレス・フラグとして読む。仮背景の列は先頭3行が空白タイル(0)なので、
+; ずれ方によっては長さ 0 の記録として読まれ、$2007 に 256 バイト流れる。
+; 症状（VBlank を 2700 サイクルはみ出す）と原因（積む側のバイト数の数え違い）が
+; 遠いので、ここで止めて数える。
+;
+; 「1回しか確定しない」も同じ検査で守られる: 確定後は vq_wr == vq_tail になるので、
+; 続けてもう一度呼んでも距離が 0 になり、申告長と一致せず突き返される
+; （open が失敗した直後に呼ばれたときも同様）。
 .proc vram_queue_close
         lda vq_wr
-        sta vq_tail
+        sec
+        sbc vq_tail                     ; 組み立てた長さ（ヘッダ込み。8bit の巻き取りで正しい）
+        sec
+        sbc #VQ_HDR
+        cmp vq_arg_len
+        bne @mismatch
+        lda vq_wr
+        sta vq_tail                     ; ★ ここで初めて NMI から見える
+        clc
+        rts
+; 積む側の間違い。中途半端な記録を見せるより、捨てて数える方がよい。
+; vq_wr を vq_tail に戻すので、リングの整合は保たれる（次の open は同じ場所から書く）。
+; 呼び出し側は C=1 を受けて「積めなかった」ものとして扱うこと。列の追跡（scroll.s）は
+; cam_col を進めないので、次フレームに同じ列がもう一度積まれる。
+@mismatch:
+        inc vq_badclose
+        lda vq_tail
+        sta vq_wr
+        sec
         rts
 .endproc
 

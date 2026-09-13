@@ -167,7 +167,9 @@ bg_extra:    .res 1          ; ブロックの右に追加で書く列数
 
 ; ---------------------------------------------------------------- キューへ積む
 ; bg_col_lo/hi の列のネームテーブル1列（30タイル）を転送キューに積む。
-;   出力: C=0 積めた / C=1 キューに空きが無い（呼び出し側が次フレームに回す）
+;   出力: C=0 積めた / C=1 積めなかった（キューに空きが無いか、確定を突き返された）。
+;         どちらも「次フレームに回せばよい」なので、呼び出し側は区別しなくてよい。
+;         区別が要るときは vram.s のカウンタを見ること。
 .proc bg_queue_column
         jsr bg_column_addr
         ldx #SCREEN_TILES_H
@@ -184,16 +186,14 @@ bg_extra:    .res 1          ; ブロックの右に追加で書く列数
         lda bg_row
         cmp #SCREEN_TILES_H
         bne @loop
-        jsr vram_queue_close
-        clc
-        rts
+        jmp vram_queue_close             ; C はそのまま呼び出し元へ返る（突き返されたら C=1）
 @full:
         sec
         rts
 .endproc
 
 ; bg_col_lo/hi の列を含む属性列（8バイト）を転送キューに積む。
-;   出力: C=0 積めた / C=1 キューに空きが無い
+;   出力: C=0 積めた / C=1 積めなかった（bg_queue_column と同じ）
 .proc bg_queue_attr
         jsr bg_attr_addr
         ldx #ATTR_ROWS
@@ -207,9 +207,7 @@ bg_extra:    .res 1          ; ブロックの右に追加で書く列数
         jsr vram_queue_byte
         dec bg_row
         bne @loop
-        jsr vram_queue_close
-        clc
-        rts
+        jmp vram_queue_close             ; 同上
 @full:
         sec
         rts
