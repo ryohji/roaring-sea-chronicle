@@ -411,6 +411,62 @@ class Nes:
         return CallResult(result_regs[0], result_regs[1], result_regs[2], result_regs[3],
                           cpu.cycles - start, executed, sp_after - saved[1])
 
+    def call_stepwise(self, addr, a=0, x=0, y=0, carry=False, budget_instructions=200000):
+        """call() と同じ呼び出しを**1命令ずつ**進めるジェネレータ。
+
+        yield のたびに「直前の命令を実行し終えた時点」で止まる。最初の yield は
+        1命令も実行していない時点、最後の yield は rts で戻った時点である。
+        yield が返す値はそこまでに実行した命令数。
+
+        何のためにあるか: 6502 の命令は割り込みに中断されない。つまり NMI が入りうる
+        のは**命令の切れ目だけ**である。したがって「メインが更新中に NMI が来ても
+        壊れた値を読まない」という主張は、命令の切れ目を全部踏んで観測すれば
+        **全数検査できる**（どのサイクルに NMI が来るかを再現する必要は無い）。
+        run_nmi_now() と組み合わせれば、切れ目ごとに実際に NMI を走らせられる。
+
+        注意: 呼び出し前後で CPU の状態（PC/SP/レジスタ）を復元するのは call() と同じだが、
+        復元はジェネレータを**最後まで回すか close() した時点**で起きる。
+        途中で捨てるときは close() すること（for 文を break で抜けたときは
+        ジェネレータが回収される時点まで復元が遅れる）。
+        """
+        cpu = self.cpu
+        saved = (cpu.pc, cpu.sp, cpu.a, cpu.x, cpu.y, cpu.p)
+        ret = (CALL_RETURN - 1) & 0xFFFF
+        cpu.push(ret >> 8)
+        cpu.push(ret & 0xFF)
+        cpu.pc = addr & 0xFFFF
+        cpu.a, cpu.x, cpu.y = a & 0xFF, x & 0xFF, y & 0xFF
+        cpu.set_flag(FLAG_C, carry)
+        executed = 0
+        try:
+            while True:
+                yield executed
+                if cpu.pc == CALL_RETURN:
+                    return
+                cpu.step()
+                executed += 1
+                if executed > budget_instructions:
+                    raise CpuCrash("$%04X を1命令ずつ呼んで %d 命令実行しても rts で戻ってこない: "
+                                   "PC=$%04X" % (addr, executed, cpu.pc))
+        finally:
+            cpu.pc, cpu.sp, cpu.a, cpu.x, cpu.y, cpu.p = saved
+
+    def run_nmi_now(self, in_vblank=True):
+        """NMI ハンドラだけを1回起動し、その間の書き込み [(アドレス, 値), ...] を返す。
+
+        run_frame() と違い、メインループを1サイクルも進めない。
+        「いまこの瞬間に NMI が来たら何を書くか」を単体で見るための足場である
+        （公開コピーと cam_x をわざと食い違わせて、NMI がどちらを読んでいるかを見るなど）。
+        call_stepwise() の切れ目で呼べば、実機の競合と同じ粒度で割り込ませられる。
+        """
+        was_vblank = self.ppu.in_vblank
+        self.ppu.in_vblank = in_vblank
+        try:
+            self._run_nmi_handler()
+        finally:
+            self.ppu.in_vblank = was_vblank
+        return list(self.nmi_writes)
+
 
 def boot(nes, limit=12):
     """起動処理（リセット → 最初の NMI）が終わるまでフレームを進め、かかったフレーム数を返す。

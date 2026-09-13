@@ -22,6 +22,7 @@ from nes import Nes, Rom, load_labels, boot    # noqa: E402
 from routes import parse_route, play, RouteError   # noqa: E402
 from l2_engine import layer2_engine, OAM_SPRITE_MAX  # noqa: E402
 from l2_scroll import layer2_scroll            # noqa: E402
+from l2_camera import layer2_camera            # noqa: E402
 
 
 ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途のオートセーブ）"
@@ -488,6 +489,8 @@ def main(argv=None):
         layer2_engine(args.rom, labels, r)
         print()
         layer2_scroll(args.rom, labels, r)
+        print()
+        layer2_camera(args.rom, labels, r)
     print()
     ran_l3 = layer3_mesen(args.rom, r)
 
