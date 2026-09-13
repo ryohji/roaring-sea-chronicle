@@ -8,6 +8,7 @@
 .import ent_x_lo, ent_x_hi, ent_lane, ent_lane_step
 .import ent_state, ent_class, ent_body, ent_tile, ent_attr
 .import lane_update_all, oam_build, cam_update
+.import action_init, action_update
 .import stage_w_lo, stage_w_hi
 
 ; --- P1 の動作確認用シーンのパラメータ ---
@@ -36,6 +37,7 @@ TEST_ENEMY_COUNT = 3
         jsr init_system
 
         jsr scene_test_init
+        jsr action_init         ; HP・状態機械の初期化（scene_test_init がエンティティを置いた後）
         jsr oam_build           ; 最初の DMA に間に合うよう1回組んでおく
 
         ; 描画を開始する。値はシャドウが持っている（init_system が決めた）。
@@ -66,7 +68,7 @@ TEST_ENEMY_COUNT = 3
 @frame:
         jsr wait_nmi
         jsr read_pad
-        jsr update_player_test
+        jsr action_update       ; 操作・攻撃・ダウンは src/action/ が持つ
         jsr lane_update_all
         jsr cam_update          ; カメラ追従 + 現れた列を転送キューへ
         jsr oam_build
@@ -143,96 +145,6 @@ TEST_ENEMY_COUNT = 3
 ; 「入力 → エンティティ → レーン補間 → OAM → 画面」の経路の確認である。
 ;   左右: ワールドX を動かす（16bit）
 ;   上下: レーンを1つ移動する（押した瞬間だけ。移動は lane.s が補間する）
-; 実際の移動と攻撃は action-dev が書く。ここは engine の確認用に留めること。
-.proc update_player_test
-        ldx #ENT_PLAYER
-
-        ; 左: ワールドの左端 (0) を越えさせない。
-        ; 越えると 16bit が巻き取って「ステージの遥か右」になり、カメラが飛ぶ。
-        lda pad_state
-        and #PAD_LEFT
-        beq @check_right
-        lda ent_x_lo, x
-        sec
-        sbc #PLAYER_SPEED
-        sta tmp0
-        lda ent_x_hi, x
-        sbc #0
-        bcc @hit_left
-        sta ent_x_hi, x
-        lda tmp0
-        sta ent_x_lo, x
-        jmp @check_right
-@hit_left:
-        lda #0
-        sta ent_x_lo, x
-        sta ent_x_hi, x
-
-        ; 右: ステージの右端を越えさせない。
-        ; ステージ幅は scroll.s が持っている（ここに長さを埋めない）。
-@check_right:
-        lda pad_state
-        and #PAD_RIGHT
-        beq @check_lane
-        lda ent_x_lo, x
-        clc
-        adc #PLAYER_SPEED
-        sta tmp0
-        lda ent_x_hi, x
-        adc #0
-        sta tmp1
-
-        lda stage_w_lo                   ; 限界 = ステージ幅 - 体1つぶん
-        sec
-        sbc #PLAYER_EDGE_MARGIN
-        sta tmp2
-        lda stage_w_hi
-        sbc #0
-        sta tmp3
-
-        lda tmp3                         ; 限界 < 新しい位置 ならクランプ
-        cmp tmp1
-        bcc @hit_right
-        bne @store_x
-        lda tmp2
-        cmp tmp0
-        bcs @store_x
-@hit_right:
-        lda tmp2
-        sta tmp0
-        lda tmp3
-        sta tmp1
-@store_x:
-        lda tmp0
-        sta ent_x_lo, x
-        lda tmp1
-        sta ent_x_hi, x
-
-@check_lane:
-        lda ent_lane_step, x
-        bne @done                ; 補間中は次のレーン移動を受け付けない
-        lda pad_pressed
-        and #PAD_UP
-        beq @check_down
-        lda ent_lane, x
-        beq @done                ; レーン0 より奥は無い
-        sec
-        sbc #1
-        jsr ent_lane_move
-        rts
-@check_down:
-        lda pad_pressed
-        and #PAD_DOWN
-        beq @done
-        lda ent_lane, x
-        cmp #LANE_LAST
-        bcs @done                ; 最も手前のレーンより先は無い
-        clc
-        adc #1
-        jsr ent_lane_move
-@done:
-        rts
-.endproc
 
 .segment "RODATA"
 
