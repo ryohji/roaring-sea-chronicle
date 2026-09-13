@@ -50,9 +50,10 @@ from nes import Nes, boot                          # noqa: E402
 from l2_scroll import (                            # noqa: E402
     CTRL_NT_X, NT_BASE, NT_WRAP_COLS, PPUADDR, PPUCTRL, PPUDATA, PPUSCROLL,
     TILE_W_SHIFT, VISIBLE_COLS, VQ_SCRATCH,
-    BgOracle, _attr_addr, _attr_problem, _cam_col, _cam_limit, _cam_x,
-    _column_problem, _flush, _get, _pending, _place_player, _queue_record,
-    _set, _set16,
+    BgOracle, attach_queue_watch, report_queue_invariants,
+    _attr_addr, _attr_problem, _cam_col, _cam_limit, _cam_x,
+    _column_problem, _diag, _diag_delta, _flush, _get, _park, _pending,
+    _place_player, _queue_record, _record_header, _set, _set16, _watch,
 )
 
 NEEDED = (
@@ -64,7 +65,8 @@ NEEDED = (
     "bg_queue_column", "bg_queue_attr",
     "vram_queue_reset", "vram_queue_open", "vram_queue_byte", "vram_queue_close",
     "vram_queue_pending", "vq_dst_lo", "vq_dst_hi", "vq_buf",
-    "vq_head", "vq_tail", "vq_wr", "vq_overflow", "vq_badstep",
+    "vq_head", "vq_tail", "vq_wr", "vq_overflow",
+    "vq_badstep", "vq_badlen", "vq_badclose",
     "ent_x_lo", "ent_x_hi",
 )
 
@@ -157,12 +159,28 @@ def layer2_camera(rom_path, labels, r):
         r.check("カメラ公開の検証用に起動する", False, str(e))
         return
 
+    # キューに触る前にメインループを待ちループへ寄せる（実機に無い再入を作らないため）。
+    # このファイルは以降フレームを回さない（nes.call / call_stepwise / run_nmi_now だけ）ので、
+    # メインループは待ちループに置かれたままになる。
+    _park(nes, labels)
+
     oracle = BgOracle(nes, labels)
     state = {}
+    if attach_queue_watch(nes, labels, state) is None:
+        r.check("記録のヘッダ長を実測できる", False,
+                "空のキューに長さ4の記録すら open できない。キューの不変条件を"
+                "辿る足場が作れないので、このセクションは飛ばした")
+        return
+
+    # 診断カウンタはセクションの前後で増えないこと。STEP の番人だけは
+    # わざと突き返させる（その節が自分で vq_badstep の増え方を見ている）ので除く。
+    counted_elsewhere = {"STEP のページ境界"}
+    dirty = []
     for name, fn in (("カメラ公開の不可分性", _check_publish_atomic),
                      ("NMI が読む出どころ", _check_nmi_reads_published),
                      ("背景の張り直し", _check_warp),
                      ("STEP のページ境界", _check_step_guard)):
+        before = _diag(nes, labels)
         try:
             fn(nes, labels, oracle, state, r)
         except CpuCrash as e:
@@ -171,6 +189,11 @@ def layer2_camera(rom_path, labels, r):
             r.check("%s の検証が最後まで走る" % name, False,
                     "検証コードが %s で止まった: %s。engine の値が想定の範囲を外れている"
                     % (type(e).__name__, e))
+        delta = _diag_delta(before, _diag(nes, labels))
+        if delta and name not in counted_elsewhere:
+            dirty.append("%s: %s" % (name, "／".join(delta)))
+
+    report_queue_invariants(nes, labels, r, dirty, "カメラ・張り直し")
 
 
 # ---------------------------------------------------------------- (a) 不可分性
@@ -388,6 +411,9 @@ def _warp(nes, labels, target):
     叩くので描画無効中に呼ぶ／$2006 を叩くので戻したあとに PPUCTRL を置き直す）。
     ここを守らずに呼ぶと、それは engine の不具合ではなく呼び出し側の誤用になる。
     """
+    watch = _watch(nes)
+    if watch is not None:
+        watch.idle("scroll_warp_to")         # 中で vram_queue_reset を呼ぶ
     saved_ctrl = nes.ppu.ctrl
     saved_mask = nes.ppu.mask
     nes.ppu.write(1, 0)                      # 手順1: 描画を止める
@@ -471,7 +497,12 @@ def _check_warp(nes, labels, oracle, state, r):
         # 揃っていなければ、張り直した絵の上に同じ絵が数十フレームかけて積み直される。
         _place_player(nes, labels, cam + DEADZONE_CENTER)
         tail_before = _get(nes, labels, "vq_tail")
+        watch = _watch(nes)
+        if watch is not None:
+            watch.idle("cam_update")
         nes.call(labels["cam_update"])
+        if watch is not None:
+            watch.chain("scroll_warp_to のあとの cam_update")
         moved = _cam_x(nes, labels) != cam
         queued = _pending(nes, labels)
         if moved or queued or _get(nes, labels, "vq_tail") != tail_before:
@@ -510,12 +541,6 @@ def _check_warp(nes, labels, oracle, state, r):
 
 
 # ---------------------------------------------------------------- (c) STEP の番人
-def _record_header(nes, labels, at):
-    """キューの記録のヘッダ [長さ, アドレス上位, アドレス下位, フラグ] を読む。"""
-    base = labels["vq_buf"]
-    return [nes.ram[(base + ((at + i) & 0xFF)) & 0x7FF] for i in range(4)]
-
-
 def _open(nes, labels, dst, length, flags):
     """vram_queue_open を叩き、受理/拒否とカウンタの動きを返す。
 
@@ -561,7 +586,12 @@ def _check_step_guard(nes, labels, oracle, state, r):
                 "空のキューに bg_queue_attr が積めなかった。STEP 形式の実測ができないので"
                 "このセクションは飛ばした")
         return
-    attr_len, attr_hi, attr_lo, attr_flags = _record_header(nes, labels, 0)
+    # 記録の位置は vq_head から取る。「reset 直後の記録は添字0」と決め打たない
+    # （決め打つと、engine が vram_queue_reset を `head := tail` の1命令に変えられない。
+    #  いまの reset は head と tail を別々の命令で 0 にするので、その隙に NMI が入ると
+    #  head=0 / tail=旧 の組が見え、バッファ先頭の残骸をヘッダとして読む）。
+    attr_len, attr_hi, attr_lo, attr_flags = _record_header(
+        nes, labels, _get(nes, labels, "vq_head"))
 
     writes = _flush(nes, labels)
     addrs = [v for a, v in writes if a == PPUADDR]
@@ -589,7 +619,7 @@ def _check_step_guard(nes, labels, oracle, state, r):
     nes.call(labels["vram_queue_reset"])
     _set16(nes, labels, "bg_col_lo", "bg_col_hi", 8)
     nes.call(labels["bg_queue_column"])
-    run_flags = _record_header(nes, labels, 0)[3]
+    run_flags = _record_header(nes, labels, _get(nes, labels, "vq_head"))[3]
 
     def step_flags(increment):
         return 0x80 | (increment & 0x7F)

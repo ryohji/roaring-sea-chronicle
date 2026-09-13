@@ -4,6 +4,8 @@ PPU はレジスタの振る舞いと VRAM/OAM への副作用だけを再現す
 描画は行わない。スキャンライン単位のタイミング（スプライト欠け、MMC3 IRQ）は
 再現しないので、その検証は Mesen2 側で行うこと（ADR-0004）。
 """
+import os
+
 from cpu6502 import Cpu, CpuCrash, FLAG_C, FLAG_Z, FLAG_N, FLAG_V
 
 CYCLES_PER_FRAME = 29780        # NTSC の1フレームの CPU サイクル数（近似）
@@ -14,6 +16,25 @@ BUTTONS = ("A", "B", "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT")
 # Nes.call() が「サブルーチンから戻ってきた」ことを検出するための番兵アドレス。
 # ROM にも RAM にも属さない領域を選んである（ここが実行されることは無い）。
 CALL_RETURN = 0x4100
+
+
+# ---------------------------------------------------------------- NMI の転送量
+# 「1回の NMI が $2007 に何バイト書いたか」を**全テストの全 NMI**で数える。
+#
+# なぜ抜き取りでは足りないか: 転送キューの記録の連なりが1バイトでもずれると、NMI は
+# データの途中を記録のヘッダとして読む。長さ0のヘッダと読めば `ldy vq_n` が 0 のまま
+# 256 回まわり、1回の NMI が $2007 に 256 バイト以上書く（VBlank を倍以上はみ出す）。
+# これは**特定の位相でしか起きない**ので、「混んでいるフレームを 20 フレーム見る」
+# 抜き取りでは位相しだいで素通りする（実際、位相をずらす掃引で初めて再現した）。
+#
+# 数えるだけはここで常時行い、予算との比較は run_tests.py が最後に1回まとめて行う。
+# Nes は検証ごとに作り直されるので、記録はモジュール側（プロセス全体）に置く。
+NMI_WRITE_WATCH = {
+    "nmis": 0,          # 観測した NMI の回数
+    "max": 0,           # 1回の NMI が $2007 に書いた最大バイト数
+    "max_cycles": 0,    # そのときの NMI ハンドラのサイクル数
+    "max_where": None,  # そのときの (ROM, フレーム番号)
+}
 
 
 class Rom:
@@ -56,6 +77,7 @@ class Ppu:
         self.in_vblank = False
         self.writes_outside_vblank = 0      # 描画中の $2007 書き込み（バグの温床）
         self.rendering_enabled = False
+        self.data_writes = 0                # $2007 への書き込み総数（NMI ごとの差分を取る）
 
     @property
     def nmi_enabled(self):
@@ -97,6 +119,7 @@ class Ppu:
                 self.addr = (self.addr & 0x00FF) | (value << 8)
             self.latch = not self.latch
         elif reg == 7:
+            self.data_writes += 1
             if self.rendering_enabled and not self.in_vblank:
                 self.writes_outside_vblank += 1
             self.vram[self.addr & 0x3FFF] = value
@@ -221,6 +244,7 @@ class Nes:
         self.rom = Rom(rom_path)
         if self.rom.mapper != 4:
             raise ValueError("このハーネスは MMC3 (mapper 4) 専用。ROM は mapper %d" % self.rom.mapper)
+        self.rom_path = rom_path
         self.prg_ram_fill = prg_ram_fill
         self._power_on_state(None)
 
@@ -247,6 +271,30 @@ class Nes:
         self.trace_nmi = False      # True にすると NMI ハンドラを単体で実行し、費用を測る
         self.nmi_cycles = None      # 直近の NMI ハンドラのサイクル数（trace_nmi 時のみ）
         self.nmi_writes = []        # 直近の NMI ハンドラが行った書き込み（trace_nmi 時のみ）
+        # NMI ごとの $2007 書き込み数（常時。trace_nmi の有無に関係なく数える）
+        self._nmi_stack = []
+        self.nmi_data_writes = None     # 直近の NMI が $2007 に書いたバイト数
+        self.nmi_data_writes_max = 0    # この Nes で観測した最大値
+
+    # ---- NMI の出入り（cpu6502 が呼ぶ。$2007 の書き込み数を NMI ごとに数えるため）----
+    def on_nmi_enter(self):
+        self._nmi_stack.append((self.ppu.data_writes, self.cpu.cycles))
+
+    def on_rti(self):
+        """rti で NMI（または IRQ）から戻った時点。書き込み数の差分を確定する。"""
+        if not self._nmi_stack:
+            return                      # IRQ ハンドラなど、入口を数えていない経路
+        writes_at_entry, cycles_at_entry = self._nmi_stack.pop()
+        count = self.ppu.data_writes - writes_at_entry
+        cycles = self.cpu.cycles - cycles_at_entry
+        self.nmi_data_writes = count
+        if count > self.nmi_data_writes_max:
+            self.nmi_data_writes_max = count
+        NMI_WRITE_WATCH["nmis"] += 1
+        if count > NMI_WRITE_WATCH["max"]:
+            NMI_WRITE_WATCH["max"] = count
+            NMI_WRITE_WATCH["max_cycles"] = cycles
+            NMI_WRITE_WATCH["max_where"] = (os.path.basename(self.rom_path), self.frame)
 
     def snapshot_prg_ram(self):
         """セーブ領域 ($6000-$7FFF) の内容を取り出す（バスを経由しない検査用）。"""

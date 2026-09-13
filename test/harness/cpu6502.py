@@ -156,6 +156,11 @@ class Cpu:
         self.cycles = 0
 
     def nmi(self):
+        # NMI の出入りをバスに知らせる（ハーネスが「1回の NMI が $2007 に何バイト
+        # 書いたか」を全 NMI で数えるため。数えない bus なら何も起きない）。
+        hook = getattr(self.bus, "on_nmi_enter", None)
+        if hook is not None:
+            hook()
         self.push(self.pc >> 8)
         self.push(self.pc & 0xFF)
         self.push((self.p | FLAG_U) & ~FLAG_B & 0xFF)
@@ -412,6 +417,9 @@ class Cpu:
         return 0
 
     def _op_RTI(self, addr, mode):
+        hook = getattr(self.bus, "on_rti", None)
+        if hook is not None:
+            hook()
         self.p = (self.pop() & ~FLAG_B & 0xFF) | FLAG_U
         lo = self.pop()
         hi = self.pop()

@@ -22,7 +22,8 @@ from nes import (Nes, Rom, load_labels, boot,  # noqa: E402
                  frame_instructions, sample_phases)
 from routes import parse_route, play, RouteError   # noqa: E402
 from l2_engine import layer2_engine, OAM_SPRITE_MAX  # noqa: E402
-from l2_scroll import layer2_scroll            # noqa: E402
+from l2_scroll import (layer2_scroll, check_nmi_write_budget,  # noqa: E402
+                       DIAG_COUNTERS)
 from l2_camera import layer2_camera            # noqa: E402
 
 
@@ -379,6 +380,22 @@ def layer2_execution(rom_path, labels, r):
     if crash is not None:
         return
 
+    # 転送キューの診断カウンタは「何度積み直しても通らない」不具合の数である
+    # （空き不足の vq_overflow とは別物で、場面が変わっても消えない）。
+    # ここは**普通に走らせたメインループ**で見ている。位相をずらして混んだ NMI を
+    # 探す必要は無く、「0 のままか」だけで積む側の数え違いが分かる。
+    present = [n for n in DIAG_COUNTERS if n in labels]
+    seen = [(n, nes.ram[labels[n] & 0x7FF]) for n in present]
+    nonzero = ["%s=%d" % (n, v) for n, v in seen if v]
+    r.check("130 フレーム走っても転送キューの診断カウンタが 0 のまま (%s)"
+            % "、".join(present), bool(present) and not nonzero,
+            "%s。vq_badclose は「open に申告した長さと実際に書いたバイト数が違った」、"
+            "vq_badlen は「長さの申告が範囲外」、vq_badstep は「STEP 記録がページ境界を"
+            "またぐ」回数で、どれも**何度積み直しても通らない**記録の数である。"
+            "0 でなければ背景の列が転送されないまま残る"
+            % ("、".join(nonzero) if nonzero
+               else "カウンタのラベルが build/roaring.labels に無い（vram.s の .export が消えた）"))
+
     # セーブ領域は 120 フレーム走り切った後の状態で見る。
     # 「起動時に有効化したが、走っているうちに誰かが $A001 を潰した」も捕まえたいため。
     layer2_save_ram(nes, r)
@@ -501,9 +518,14 @@ def main(argv=None):
         print()
         layer2_engine(args.rom, labels, r)
         print()
-        layer2_scroll(args.rom, labels, r)
+        scroll_state = layer2_scroll(args.rom, labels, r) or {}
         print()
         layer2_camera(args.rom, labels, r)
+        print()
+        # ここまでの検証が回した**全ての NMI** をまとめて見る。転送量の上限は
+        # 抜き取り（混んでいるフレームを20フレーム）では位相しだいで素通りするので、
+        # 数えるのは harness に常時やらせ、予算との比較をここで1回行う。
+        check_nmi_write_budget(scroll_state.get("budget"), r)
     print()
     ran_l3 = layer3_mesen(args.rom, r)
 
