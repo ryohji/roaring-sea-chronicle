@@ -14,6 +14,6 @@
 | `props/` | レイアウトID × 時代 → 物体配置リスト（1時代 200〜400 B） | stage-author | P3 |
 | `gimmicks/` | ルート固有機構（**1ルート1機構に厳守**） | stage-author | P3 |
 | `waves/` | 敵ウェーブ | stage-author | P3 |
-| `text/` | 話者タグ付き台詞。辞書圧縮の入力 | text-budget | P7 |
+| `text/` | 話者タグ付き台詞。辞書圧縮の入力 | **scenario-writer** | P6〜P7 |
 
 変換器は入力を検証し、壊れたデータは**ビルドを失敗させる**こと。黙って通さない。

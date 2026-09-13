@@ -53,7 +53,8 @@
 | ai-dev | `src/ai/`, `data/ai_params.tsv` |
 | campaign-dev | `src/campaign/`, `data/flags.tsv`, `data/scenario.tsv`, `data/roster.tsv` |
 | stage-author | `src/stage/`, `data/layouts|props|gimmicks|waves/`, `tools/` |
-| text-budget | `src/text/`, `data/text/`, `docs/budget.md`, `tools/budget.py` |
+| text-budget | `src/text/`, `docs/budget.md`, `tools/budget.py` |
+| scenario-writer | `data/text/` |
 | qa-runner | `test/` |
 
 自分の範囲外のファイルを変更する必要が生じたら、**変更せずに報告する**。
