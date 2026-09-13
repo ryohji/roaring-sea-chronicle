@@ -24,7 +24,9 @@ ASFLAGS := -g -I src --bin-include-dir $(CHRDIR)
 LDFLAGS := -C $(CFG) -m $(MAP) -Ln $(LABELS)
 
 SRCS    := $(shell find src -name '*.s' | sort)
-INCS    := $(wildcard src/*.inc)
+# src/ 以下の .inc は全て依存に入れる。src/action/*.inc（調整値）が漏れると、
+# 主が数値を書き換えても再ビルドされず、「触るだけで手触りが変わる」が成立しない。
+INCS    := $(shell find src -name '*.inc' | sort)
 OBJS    := $(patsubst src/%.s,$(OBJDIR)/%.o,$(SRCS))
 
 CHRPNG  := $(wildcard chr/*.png)
