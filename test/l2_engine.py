@@ -20,7 +20,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "harness"))
 
 from cpu6502 import CpuCrash                  # noqa: E402
-from nes import Nes, VBLANK_CYCLES, boot      # noqa: E402
+from nes import (Nes, VBLANK_CYCLES, boot,          # noqa: E402
+                 frame_end, step_frame, frame_instructions)
 
 # --- src/constants.inc と対応する値。ここに無いものは ROM かラベルから導出する ---
 OAM_SPRITE_MAX = 64          # PPU のハード制約（OAM は 64 エントリ）
@@ -43,7 +44,8 @@ ENT_FIELDS = ("ent_active", "ent_x_lo", "ent_x_hi", "ent_y", "ent_lane", "ent_la
 NEEDED = ENT_FIELDS + (
     "oam_build", "oam_sort_order", "oam_order", "oam_used", "oam_dropped", "oam_next",
     "sort_count", "oam_shadow", "cam_x_lo", "cam_x_hi",
-    "rect_overlap", "rect_a", "rect_b", "lane_distance", "lane_ground_y", "body_width")
+    "rect_overlap", "rect_a", "rect_b", "lane_distance", "lane_ground_y", "body_width",
+    "wait_nmi")
 
 RECT_X_LO, RECT_X_HI, RECT_Y, RECT_W, RECT_H = 0, 1, 2, 3, 4
 
@@ -99,19 +101,22 @@ def set_camera(nes, labels, x):
     nes.ram[labels["cam_x_hi"] & 0x7FF] = (x >> 8) & 0xFF
 
 
-def tap(nes, button):
-    """1フレームだけ押して離す。押した瞬間 (pad_pressed) を作るための最小単位。
+def tap(nes, labels, button):
+    """1フレームだけ押して離し、そのフレームの更新が終わった点で止める。
 
-    注意: run_frames が戻る位置はメインループが1フレームぶんの処理を走らせている最中である
-    （run_tests.py 冒頭の注記）。したがって、この直後に読む RAM の値は
-    **一様に1フレーム遅れることがある**。ここで書いてよいのは
-    「遅れが一様でも結論が変わらない主張」（推移が単調である・最後に表の値へ吸着する・
-    移動中の再入力が目標を変えない）だけである。
-    「n フレーム目にちょうどこの値」のような、観測点の位置で答えが変わる主張を書いてはならない。
+    run_frames が戻る位置はメインループが1フレームぶんの更新を走らせている**最中**なので、
+    そこで止めると、読む相手によって「1フレーム古い値」と「更新の途中の値」の
+    どちらにも転ぶ。step_frame() でフレームの更新が終わった点まで進めてから返すことで、
+    この直後に読む値を「押した1フレームぶんの更新を終えた状態」に固定する
+    （作業変数の読み方は harness/nes.py 冒頭の「観測の作法」を見よ）。
+
+    したがって、この直後の読みは **一様に1フレーム遅れる**こともなければ、
+    更新の途中を覗くこともない。ent_lane_step のような作業変数を読んでよい。
     """
     nes.set_buttons({button})
     nes.run_frames(1)
     nes.set_buttons(set())
+    frame_end(nes, labels)
 
 
 def table_length(labels, name):
@@ -205,19 +210,25 @@ def _check_table_layout(nes, labels, ents, lane_y, r):
 
 
 # ---------------------------------------------------------------- レーン補間
-def _slide(nes, ents, button, max_frames=90):
+def _slide(nes, labels, ents, button, max_frames=90):
     """button を1フレーム押し、レーン補間が終わるまで走らせる。
 
     戻り値: (各フレームの ent_y の列, かかったフレーム数)。
     LANE_MOVE_FRAMES を期待値に焼き付けない（主が手触りを調整したときに落ちないように）ため、
     「ent_lane_step が 0 に戻るまで」で待つ。
+
+    待ちの条件に使う ent_lane_step も、集める ent_y も、フレームの更新が終わった点
+    （step_frame）で読む。生の run_frames の戻り位置で読むと、到着したフレームだけは
+    lane_step_one の到着処理の**途中** — dec ent_lane_step で step が 0 になった直後、
+    足元Yの吸着と acc/dy の消去がまだ済んでいない点 — で抜けてしまい、
+    「移動後の状態」を名乗れない値を持ち帰る（harness/nes.py 冒頭「観測の作法」(b)）。
     """
     samples = [ents.peek("ent_y", 0)]
-    tap(nes, button)
+    tap(nes, labels, button)
     samples.append(ents.peek("ent_y", 0))
     frames = 1
     while ents.peek("ent_lane_step", 0) != 0 and frames < max_frames:
-        nes.run_frames(1)
+        step_frame(nes, labels)
         samples.append(ents.peek("ent_y", 0))
         frames += 1
     return samples, frames
@@ -257,7 +268,7 @@ def _check_lane_interpolation(nes, labels, ents, lane_y, r):
             % (ents.peek("ent_y", 0), start_lane, lane_y[start_lane]))
 
     # --- DOWN 1回: 手前のレーンへ補間で移動する ---
-    samples, frames = _slide(nes, ents, "DOWN")
+    samples, frames = _slide(nes, labels, ents, "DOWN")
     target_lane = start_lane + 1
     target_y = lane_y[target_lane]
 
@@ -273,22 +284,49 @@ def _check_lane_interpolation(nes, labels, ents, lane_y, r):
             % (target_lane, target_y), problem is None,
             "%s。ent_y の推移=%s（%d フレーム）。補間の累算（lane_step_one）か、"
             "到着時の吸着が壊れている" % (problem, samples, frames))
-    r.check("レーン移動の完了後に補間の作業変数が片付いている",
-            ents.peek("ent_lane_step", 0) == 0 and ents.peek("ent_lane_acc", 0) == 0
-            and ents.peek("ent_lane_dy", 0) == 0,
-            "step=%d acc=%d dy=%d（期待は全て 0）。残っていると次の移動が前回の端数から始まる"
-            % (ents.peek("ent_lane_step", 0), ents.peek("ent_lane_acc", 0),
-               ents.peek("ent_lane_dy", 0)))
+    # 作業変数はフレームの更新が終わった点で読む（_slide がそこで止めてある）。
+    # 「更新が終われば片付いている」がエンジンの不変条件であって、
+    # 「更新の途中のどの瞬間も片付いている」ではない（到着処理は step → 足元Y → acc → dy の順に
+    # 書くので、その最中には必ず半端な状態が存在する）。
+    def work():
+        return (ents.peek("ent_lane_step", 0), ents.peek("ent_lane_acc", 0),
+                ents.peek("ent_lane_dy", 0))
+
+    r.check("レーン移動の完了後に補間の作業変数が片付いている", work() == (0, 0, 0),
+            "step=%d acc=%d dy=%d（期待は全て 0）。残っていると次の移動が前回の端数から始まる。"
+            "※ この値はフレームの更新が終わった点（step_frame）で読んでいる。"
+            "更新の最中で読んでいるなら、それはテスト側の観測点の誤りである" % work())
+
+    # 上の1件は「更新が終わった点」という1箇所で見た主張である。それが位相に依存していない
+    # ことまで縛る。静止しているエンティティは lane_update_all に拾われないので、
+    # 作業変数はフレームの**どの命令の切れ目**でも 0 のままでなければならない。
+    # ここが破れたら、静止中のエンティティの作業変数を誰かが毎フレーム書いている。
+    dirty = None
+    count = 0
+    for _ in frame_instructions(nes, labels):
+        count += 1
+        if work() != (0, 0, 0):
+            dirty = (count, work())
+            break
+    r.check("静止したエンティティの補間作業変数は、フレーム更新中のどの命令の切れ目でも 0 "
+            "（%d 箇所を全数検査）" % count, dirty is None,
+            "移動を終えた #0 の作業変数が %s (step, acc, dy)=%s になっている。"
+            "更新に入る前から汚れているなら到着処理の片付け漏れ、更新中に汚れたなら "
+            "ent_lane_step が 0 のエンティティを lane_update_all が飛ばしていない。"
+            "どちらにせよ、作業変数を見る検証はすべて観測点しだいで結論が変わる状態である"
+            % ("フレームの更新に入る前から" if dirty and dirty[0] == 1
+               else "更新の %s 命令目の切れ目で" % (dirty[0] if dirty else -1),
+               dirty[1] if dirty else None))
 
     # --- 補間中の再入力が無視されること ---
     samples2 = [ents.peek("ent_y", 0)]
-    tap(nes, "UP")                                   # レーン移動を始める
+    tap(nes, labels, "UP")                           # レーン移動を始める
     lane_mid = ents.peek("ent_lane", 0)
-    tap(nes, "DOWN")                                 # 補間の途中で逆方向を入れる
+    tap(nes, labels, "DOWN")                         # 補間の途中で逆方向を入れる
     interrupted_lane = ents.peek("ent_lane", 0)
     interrupted_step = ents.peek("ent_lane_step", 0)
     while ents.peek("ent_lane_step", 0) != 0:
-        nes.run_frames(1)
+        step_frame(nes, labels)
         samples2.append(ents.peek("ent_y", 0))
     samples2.append(ents.peek("ent_y", 0))
     r.check("補間中の再入力が無視される", interrupted_lane == lane_mid,
@@ -305,7 +343,7 @@ def _check_lane_interpolation(nes, labels, ents, lane_y, r):
     problems = []
     for _ in range(LANE_COUNT + 1):
         before = ents.peek("ent_lane", 0)
-        samples, frames = _slide(nes, ents, "UP")
+        samples, frames = _slide(nes, labels, ents, "UP")
         now = ents.peek("ent_lane", 0)
         expect = max(0, before - 1)
         if now != expect:
@@ -334,7 +372,7 @@ def _check_lane_interpolation(nes, labels, ents, lane_y, r):
     problems = []
     for _ in range(LANE_COUNT + 1):
         before = ents.peek("ent_lane", 0)
-        samples, frames = _slide(nes, ents, "DOWN")
+        samples, frames = _slide(nes, labels, ents, "DOWN")
         now = ents.peek("ent_lane", 0)
         expect = min(LANE_COUNT - 1, before + 1)
         if now != expect:

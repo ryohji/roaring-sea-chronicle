@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.join(HERE, "harness"))
 sys.path.insert(0, HERE)
 
 from cpu6502 import CpuCrash                  # noqa: E402
-from nes import Nes, Rom, load_labels, boot    # noqa: E402
+from nes import (Nes, Rom, load_labels, boot,  # noqa: E402
+                 frame_instructions, sample_phases)
 from routes import parse_route, play, RouteError   # noqa: E402
 from l2_engine import layer2_engine, OAM_SPRITE_MAX  # noqa: E402
 from l2_scroll import layer2_scroll            # noqa: E402
@@ -43,31 +44,23 @@ ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途�
 # 対策は「観測点がフレームのどこにあっても同じ値が読める状態にしてから読む」ことである。
 # 入力を離してキャラが静止していれば、組み立て途中の OAM シャドウを読んでも値は変わらない。
 # 位置の比較を行うテストは必ず settle() を通してから読むこと。
+#
+# **ただし settle() で救えるのは「落ち着けば動かなくなる量」だけである。**
+# 作業変数（ent_lane_step / ent_lane_acc / ent_lane_dy、これから増える act_timer /
+# act_hitstop / act_invuln のようなタイマー類）は、静止していても**更新の最中には
+# 半端な値を通過する**。それらを run_frames の直後に生で読むと、メインループの
+# 命令数が変わった日に別の隙間を覗いて落ちる。作業変数は harness の
+# frame_end() / step_frame() で「そのフレームの更新が終わった点」まで進めてから読むこと。
+# 作法の全体は test/harness/nes.py 冒頭の「観測の作法」にまとめてある。
 SETTLE_FRAMES = 2
 
-# 観測点をフレーム内でずらす量（サイクル）。メインループの途中・処理が終わって
-# wait_nmi で待っている間・次の NMI の直前、をそれぞれ踏むように選んである。
-PHASE_STEPS = (1200, 10000, 16000)
+# sample_phases / PHASE_STEPS は harness/nes.py に移してある（l2_* からも使うため）。
 
 
 def settle(nes, frames=SETTLE_FRAMES):
     """入力を離して数フレーム走らせ、観測点に依存しない（静止した）状態にする。"""
     nes.set_buttons(set())
     nes.run_frames(frames)
-
-
-def sample_phases(nes, read):
-    """同じ量をフレーム内の複数の位置で観測し、値の列を返す。
-
-    静止しているはずの量がここで揺れたら、そのテストは「フレームのどのサイクルで
-    観測したか」に合否が依存している。run_cycles で位相をずらすだけなので、
-    フレームの数え上げ（NMI の回数）には影響しない。
-    """
-    values = [read()]
-    for delta in PHASE_STEPS:
-        nes.run_cycles(delta)
-        values.append(read())
-    return values
 
 
 # ---------------------------------------------------------------- 起動の予算
@@ -286,6 +279,26 @@ def layer2_execution(rom_path, labels, r):
                 "oam_used=%d。この画面には操作キャラ1体と敵3体が居るので 0 でも 64 でもないはず。"
                 "0 なら何も描いていない、64 なら上の「未使用エントリ」の検証が空振りになる"
                 % used)
+
+        # oam_used は「組み立て中の数」——作業変数である（harness/nes.py 冒頭の作法 (b)）。
+        # 上の2件は run_frames の直後、つまりメインループが oam_build を走らせている
+        # **最中**に読んでいる。それが許されるのは、oam_build が oam_used を最後に1回だけ
+        # 書く（＝静止したシーンでは毎フレーム同じ値になる）からであって、
+        # 「作業変数を run_frames の直後に読んでよい」からではない。
+        # その前提そのものをここで縛る。oam_used を数えながら増やす実装に変えたら、
+        # 上の2件が観測点しだいで落ちるより先に、この名前で落ちてほしい。
+        used_seen = set()
+        boundaries = 0
+        for _ in frame_instructions(nes, labels):
+            boundaries += 1
+            used_seen.add(nes.ram[oam_used_addr & 0x7FF])
+        r.check("静止中の oam_used はフレーム更新中のどの命令の切れ目でも同じ値"
+                "（%d 箇所を全数検査）" % boundaries, used_seen == {used},
+                "1フレームの更新中に oam_used が %s と揺れた（更新の終わりでは %d）。"
+                "組み立ての途中経過が oam_used に見えている＝上の「未使用の OAM エントリ」の"
+                "検証は、フレームのどのサイクルで読んだかで結論が変わる。"
+                "途中経過は oam_next に置き、oam_used は完成時に1回だけ書くこと"
+                % (sorted(used_seen), used))
 
     if labels and "frame_counter" in labels:
         delta = (fc_after - fc_at_boot) & 0xFF

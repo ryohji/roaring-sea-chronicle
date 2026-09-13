@@ -486,6 +486,148 @@ def boot(nes, limit=12):
     return None
 
 
+# ---------------------------------------------------------------- 観測の作法
+# ここから下は「いつ読むか」を決めるための足場である。読む量は2種類あり、
+# 作法が違う。取り違えると、**プロダクトが正しいのにテストだけが落ちる**。
+#
+#   (a) 落ち着けば動かなくなる量 — 位置・OAM・カメラ・VRAM の中身
+#       入力を離して数フレーム走らせれば（run_tests.py の settle()）、
+#       フレーム内のどの位相で読んでも同じ値になる。位相をずらして確かめられる
+#       （sample_phases）。
+#
+#   (b) 作業変数 — ent_lane_step / ent_lane_acc / ent_lane_dy、
+#       これから増える act_timer / act_hitstop / act_invuln のようなタイマー類、
+#       oam_next / oam_used / sort_count のような組み立て中の数
+#       これらは**毎フレーム更新の途中で何度も書き換わる**。run_frames() が戻るのは
+#       フレームの切れ目ではなく更新の**最中**なので、そこで生に読むと
+#       「更新の途中の値」が見える。静止させても (a) のようには救えない。
+#       更新の最中に読んでいる限り、メインループの命令数が変われば
+#       （＝誰かが src/ に処理を1つ足せば）観測点が別の隙間に移動して答えが変わる。
+#
+#       (b) を読むときは frame_end() / step_frame() を通し、
+#       **そのフレームの更新が終わった点**で読むこと。
+#       「更新が終われば作業変数はこうなっている」はエンジンの不変条件であり、
+#       そこでなら観測点の位置に依存しない。
+#
+#       実例: 「レーン移動の完了後に補間の作業変数が片付いている」は、
+#       lane_step_one の到着処理（dec ent_lane_step → 足元Yの吸着 → acc/dy の消去）の
+#       **途中**、dec の直後の分岐で観測していた。ent_lane_step だけ 0 になっていて
+#       ent_lane_dy はまだ 20 のままの点である。エンジンは正しく、テストが覗く位置が
+#       悪かった。src/action/ が入ってメインループが伸びた日に落ちた。
+
+# 観測点をフレーム内でずらす量（サイクル）。メインループの途中・処理が終わって
+# wait_nmi で待っている間・次の NMI の直前、をそれぞれ踏むように選んである。
+PHASE_STEPS = (1200, 10000, 16000)
+
+# メインループが「そのフレームの更新を終えて次の NMI を待っている」点の目印。
+# main.s の wait_nmi（nmi_done を 0 にしてから立つまで回るループ）である。
+WAIT_LABEL = "wait_nmi"
+
+
+def sample_phases(nes, read, steps=PHASE_STEPS):
+    """同じ量をフレーム内の複数の位置で観測し、値の列を返す。
+
+    静止しているはずの量がここで揺れたら、そのテストは「フレームのどのサイクルで
+    観測したか」に合否が依存している。run_cycles で位相をずらすだけなので、
+    フレームの数え上げ（NMI の回数）には影響しない。
+    """
+    values = [read()]
+    for delta in steps:
+        nes.run_cycles(delta)
+        values.append(read())
+    return values
+
+
+def _wait_span(labels):
+    """wait_nmi のアドレス範囲 (先頭, 末尾+1) を返す。
+
+    末尾は「次に来るグローバルラベル」で決める。ローカルラベル（@wait など）は
+    proc の内側にあるので境界に使えない（使うと待ちループ自体が範囲から外れる）。
+    """
+    lo = labels.get(WAIT_LABEL)
+    if lo is None:
+        raise CpuCrash("ラベル %s が build/roaring.labels に無い。メインループの "
+                       "「フレームの更新が終わった点」を特定できないので、"
+                       "作業変数を安全に読めない（main.s の wait_nmi が消えたか名前が変わった）"
+                       % WAIT_LABEL)
+    after = [a for name, a in labels.items() if a > lo and "@" not in name]
+    span = min(min(after) - lo, 64) if after else 64
+    return lo, lo + span
+
+
+def frame_end(nes, labels, max_instructions=100_000):
+    """メインループがそのフレームぶんの更新を終え、次の NMI を待ち始める点まで進める。
+
+    run_frames() の戻り位置は更新の**最中**である。作業変数（上の (b)）を読む前に
+    これを通すと、「そのフレームの更新が終わった状態」を読める。
+    NMI を1回も起こさないので、フレームの数え上げは変わらない（位相だけが進む）。
+
+    止まるのは wait_nmi の**待ちループを回っている**点であって、wait_nmi に入った瞬間ではない。
+    入口には nmi_done を 0 に戻す `lda #0 / sta nmi_done` があり、そこで止めてしまうと、
+    「NMI を起こしてから再開する」使い方（frame_instructions）で立てたばかりの nmi_done を
+    消してしまい、永久に待ち続ける。ループを1周して同じ番地に戻ったことで判定する。
+
+    すでに待ちに入っているときは数命令で戻る（二重に呼んでも安全）。
+    """
+    lo, hi = _wait_span(labels)
+    executed = 0
+    seen = set()
+    while True:
+        pc = nes.cpu.pc
+        if lo <= pc < hi:
+            if pc in seen:              # 待ちループを1周した＝更新は終わっている
+                return executed
+            seen.add(pc)
+        nes.cpu.step()
+        executed += 1
+        if executed > max_instructions:
+            raise CpuCrash("%d 命令進めてもメインループが %s ($%04X-$%04X) の待ちループに戻らない: "
+                           "PC=$%04X。1フレームぶんの更新が終わらない＝"
+                           "どこかで別の待ちループに入っている"
+                           % (executed, WAIT_LABEL, lo, hi - 1, nes.cpu.pc))
+
+
+def step_frame(nes, labels, n=1):
+    """n フレーム進め、最後のフレームの更新が終わった点で止める。
+
+    作業変数を毎フレーム観測しながら進むループは run_frames ではなくこれを使うこと。
+    """
+    nes.run_frames(n)
+    return frame_end(nes, labels)
+
+
+def frame_instructions(nes, labels, max_instructions=100_000):
+    """1フレームぶんの更新を**1命令ずつ**進めるジェネレータ。yield ごとに命令の切れ目で止まる。
+
+    frame_end() は「更新が終わった点」という1箇所を選んで読む足場だが、
+    こちらは**更新中のあらゆる命令の切れ目**を踏む。
+    「静止しているエンティティの作業変数は、フレームのどこを覗いても 0 のままである」
+    のような、位相に一切依存しないことそのものを主張したいときに使う
+    （call_stepwise() が cam_publish に対してやっているのと同じ考え方の、フレーム版）。
+
+    呼ぶ前にフレームの切れ目へ揃える。NMI ハンドラは単体で走らせてから、
+    メインループの更新だけを刻む。
+    """
+    frame_end(nes, labels)                # 待ちループの中（nmi_done は 0 に戻された後）
+    lo, hi = _wait_span(labels)
+    nes.run_nmi_now()                     # nmi_done を立てる。待ちループが抜ける
+    executed = 0
+    while lo <= nes.cpu.pc < hi:          # まず待ちループから出る
+        nes.cpu.step()
+        executed += 1
+        if executed > max_instructions:
+            raise CpuCrash("NMI を起こしても %s から出てこない: PC=$%04X。"
+                           "nmi_done が立っていない疑い" % (WAIT_LABEL, nes.cpu.pc))
+    while not (lo <= nes.cpu.pc < hi):    # 更新が終わって待ちに戻るまで刻む
+        yield executed
+        nes.cpu.step()
+        executed += 1
+        if executed > max_instructions:
+            raise CpuCrash("%d 命令進めてもメインループが %s に戻らない: PC=$%04X"
+                           % (executed, WAIT_LABEL, nes.cpu.pc))
+    yield executed
+
+
 def load_labels(path):
     """ld65 の -Ln が出すラベルファイルを {名前: アドレス} に読む。"""
     labels = {}
