@@ -412,6 +412,24 @@ class Nes:
                           cpu.cycles - start, executed, sp_after - saved[1])
 
 
+def boot(nes, limit=12):
+    """起動処理（リセット → 最初の NMI）が終わるまでフレームを進め、かかったフレーム数を返す。
+
+    「起動は N フレームで終わる」という前提をテストの各所に散らさないための足場である。
+    起動処理の長さは P3/P4 で初期転送が増えれば延びる。延びたこと自体は
+    run_tests.py が **専用の検証**（BOOT_FRAMES_MAX）で名指しで捕まえる。
+    それ以外のテストは「起動が終わったら」という条件だけを使うこと。
+
+    最初の NMI が来たかどうかは OAM DMA の有無で見る（NMI ハンドラの最初の仕事）。
+    limit フレーム以内に来なければ None を返す（呼び出し側が失敗として報告すること）。
+    """
+    for i in range(1, limit + 1):
+        nes.run_frames(1)
+        if nes.dma_count:
+            return i
+    return None
+
+
 def load_labels(path):
     """ld65 の -Ln が出すラベルファイルを {名前: アドレス} に読む。"""
     labels = {}

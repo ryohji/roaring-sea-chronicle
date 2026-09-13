@@ -19,8 +19,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "harness"))
 
-from cpu6502 import CpuCrash            # noqa: E402
-from nes import Nes, VBLANK_CYCLES      # noqa: E402
+from cpu6502 import CpuCrash                  # noqa: E402
+from nes import Nes, VBLANK_CYCLES, boot      # noqa: E402
 
 # --- src/constants.inc と対応する値。ここに無いものは ROM かラベルから導出する ---
 OAM_SPRITE_MAX = 64          # PPU のハード制約（OAM は 64 エントリ）
@@ -100,7 +100,15 @@ def set_camera(nes, labels, x):
 
 
 def tap(nes, button):
-    """1フレームだけ押して離す。押した瞬間 (pad_pressed) を作るための最小単位。"""
+    """1フレームだけ押して離す。押した瞬間 (pad_pressed) を作るための最小単位。
+
+    注意: run_frames が戻る位置はメインループが1フレームぶんの処理を走らせている最中である
+    （run_tests.py 冒頭の注記）。したがって、この直後に読む RAM の値は
+    **一様に1フレーム遅れることがある**。ここで書いてよいのは
+    「遅れが一様でも結論が変わらない主張」（推移が単調である・最後に表の値へ吸着する・
+    移動中の再入力が目標を変えない）だけである。
+    「n フレーム目にちょうどこの値」のような、観測点の位置で答えが変わる主張を書いてはならない。
+    """
     nes.set_buttons({button})
     nes.run_frames(1)
     nes.set_buttons(set())
@@ -127,7 +135,13 @@ def layer2_engine(rom_path, labels, r):
     try:
         nes = Nes(rom_path)
         nes.reset()
-        nes.run_frames(4)
+        # 「起動は N フレームで終わる」をここに書かない。起動が延びたことは
+        # run_tests.py の BOOT_FRAMES_MAX が名指しで捕まえる（そこで落ちてほしい）。
+        if boot(nes) is None:
+            r.check("engine の検証用に起動する", False,
+                    "起動しても NMI が来ない（OAM DMA が1回も無い）。"
+                    "起動処理の検証を先に見よ")
+            return
     except CpuCrash as e:
         r.check("engine の検証用に起動する", False, str(e))
         return
@@ -456,6 +470,36 @@ def _check_sort_order(nes, labels, ents, lane_y, r):
              for i in range(nes.ram[labels["sort_count"] & 0x7FF])]
     r.check("同じ配置なら並びが毎回同じ（フレーム間で暴れない）", again == order,
             "1回目=%s / 2回目=%s。前フレームの並びが結果に影響している" % (order, again))
+
+    # --- 番兵 (oam_sortkey_guard) を汚してから呼んでも並びが壊れないこと ---
+    # 挿入ソートの内側ループは oam_sortkey の1バイト手前を読み、そこに置いた $00 で止まる。
+    # 「起動時に 0 だから大丈夫」に頼っていると、番兵が別の値になった瞬間に
+    # ループが添字 0 を通り越し、**隣の配列を並べ替えキーとして読みながら RAM を
+    # 塗り潰す**という気付きにくい壊れ方をする。番兵を張り直しているかを直接見る。
+    guard = labels.get("oam_sortkey_guard")
+    if guard is None:
+        r.check("並べ替えキーの番兵 (oam_sortkey_guard) がある", False,
+                "ラベル oam_sortkey_guard が build/roaring.labels に無い。"
+                "挿入ソートの停止を番兵で保証する作りが消えている（sprite.s を見よ）")
+    else:
+        nes.ram[guard & 0x7FF] = 0xFF            # 前のフレームが残した「どのキーより大きい値」
+        try:
+            nes.call(labels["oam_sort_order"])
+            dirty = [nes.ram[(labels["oam_order"] + i) & 0x7FF]
+                     for i in range(nes.ram[labels["sort_count"] & 0x7FF])]
+            crashed = None
+        except CpuCrash as e:
+            dirty, crashed = [], e
+        r.check("並べ替えキーの番兵が汚れていても並びが壊れない",
+                crashed is None and dirty == order and nes.ram[guard & 0x7FF] == 0,
+                "番兵に $FF を置いてから oam_sort_order を呼んだら %s。"
+                "番兵は呼び出しのたびに張り直すこと（sprite.s の `sta oam_sortkey_guard`）。"
+                "張り直しが無いと、挿入ソートが添字 0 で止まらず oam_sortkey の手前へ "
+                "はみ出して読み書きし、スプライトの前後関係が壊れるだけでなく "
+                "隣のグローバル変数を塗り潰す"
+                % ("クラッシュした: %s" % crashed if crashed
+                   else "並びが %s になった（期待 %s、呼び出し後の番兵=$%02X）"
+                        % (dirty, order, nes.ram[guard & 0x7FF])))
 
 
 # ---------------------------------------------------------------- OAM 展開

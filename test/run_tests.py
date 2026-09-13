@@ -17,13 +17,72 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "harness"))
 sys.path.insert(0, HERE)
 
-from cpu6502 import CpuCrash            # noqa: E402
-from nes import Nes, Rom, load_labels   # noqa: E402
+from cpu6502 import CpuCrash                  # noqa: E402
+from nes import Nes, Rom, load_labels, boot    # noqa: E402
 from routes import parse_route, play, RouteError   # noqa: E402
 from l2_engine import layer2_engine, OAM_SPRITE_MAX  # noqa: E402
+from l2_scroll import layer2_scroll            # noqa: E402
 
 
 ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途のオートセーブ）"
+
+# ---------------------------------------------------------------- 観測の作法
+# ハーネスの run_frames() が戻るのは「NMI から VBlank ぶんだけ進めた点」であって、
+# フレームの切れ目ではない。その点はメインループが1フレームぶんの処理を走らせている
+# **最中**である。実測（P1 後半時点）:
+#     NMI+0     NMI ハンドラ（OAM DMA → VRAM 転送 → スクロール設定）
+#     NMI+997   read_pad
+#     NMI+1466  lane_update_all
+#     NMI+2247  oam_build が操作キャラの OAM シャドウ X を書く   ← ここ
+#     NMI+2280  run_frames が戻る
+# つまり「入力を離しても動かない」の類を run_frames の直後に生で読むと、
+# 余裕はわずか 33 サイクルしかなく、フレームの処理が数十サイクル増減しただけで
+# 「1フレーム古い OAM」を読む側に倒れる（実際、engine-dev の作業中に倒れた）。
+#
+# 対策は「観測点がフレームのどこにあっても同じ値が読める状態にしてから読む」ことである。
+# 入力を離してキャラが静止していれば、組み立て途中の OAM シャドウを読んでも値は変わらない。
+# 位置の比較を行うテストは必ず settle() を通してから読むこと。
+SETTLE_FRAMES = 2
+
+# 観測点をフレーム内でずらす量（サイクル）。メインループの途中・処理が終わって
+# wait_nmi で待っている間・次の NMI の直前、をそれぞれ踏むように選んである。
+PHASE_STEPS = (1200, 10000, 16000)
+
+
+def settle(nes, frames=SETTLE_FRAMES):
+    """入力を離して数フレーム走らせ、観測点に依存しない（静止した）状態にする。"""
+    nes.set_buttons(set())
+    nes.run_frames(frames)
+
+
+def sample_phases(nes, read):
+    """同じ量をフレーム内の複数の位置で観測し、値の列を返す。
+
+    静止しているはずの量がここで揺れたら、そのテストは「フレームのどのサイクルで
+    観測したか」に合否が依存している。run_cycles で位相をずらすだけなので、
+    フレームの数え上げ（NMI の回数）には影響しない。
+    """
+    values = [read()]
+    for delta in PHASE_STEPS:
+        nes.run_cycles(delta)
+        values.append(read())
+    return values
+
+
+# ---------------------------------------------------------------- 起動の予算
+# 起動処理（リセット → 最初の NMI）に許すフレーム数の上限。
+# init.s は PPU のウォームアップで VBlank を2回待ち、そのあと MMC3 初期化・パレット転送・
+# 背景1画面ぶんの初期転送・シーン構築・最初の oam_build を済ませてから NMI を許可する。
+# この「2回目の VBlank 待ちのあと」の仕事がフレーム長を超えると、最初の NMI が
+# 1フレームぶん後ろにずれる。実測ではリセットから 3 フレーム目に最初の NMI が来ており、
+# 2回目の VBlank 待ちから先には約 8000 サイクル（0.27 フレーム）しか余裕が無い。
+#
+# 上限を 4 にしてあるのは、P3/P4 で初期転送が増えたときに 1 フレームぶんの伸びは
+# 許し、それ以上伸びたら**この検証が名指しで落ちる**ようにするためである。
+# 「DMA が毎フレーム走る」「frame_counter が増える」といった別の主張のテストが
+# 起動の重さで落ちると、原因が分からなくなる。上限を上げるときは、
+# 起動時間が延びてよいのかを先に考えること（最初の絵が出るまでの待ち時間である）。
+BOOT_FRAMES_MAX = 4
 
 
 class Results:
@@ -129,15 +188,35 @@ def layer1_save_header(rom, r):
 def layer2_execution(rom_path, labels, r):
     print("L2 実行検証（Python 6502 エミュレータ）")
 
+    boot_limit = BOOT_FRAMES_MAX + 8        # 超えていても「何フレームかかったか」は報告したい
     try:
         nes = Nes(rom_path)
         nes.reset()
+        boot_frames = boot(nes, limit=boot_limit)
+        dma_at_boot = nes.dma_count
+        fc_at_boot = nes.ram[labels["frame_counter"] & 0x7FF] if "frame_counter" in labels else 0
         nes.run_frames(10)
+        # フレーム数の勘定はここで締める。以降の検証もフレームを進めるので、
+        # あとで読むと「10フレームぶん」ではなくなる。
+        fc_after = nes.ram[labels["frame_counter"] & 0x7FF] if "frame_counter" in labels else 0
     except CpuCrash as e:
         r.check("リセットから10フレーム走る", False, str(e))
         return
     r.section("起動・描画・入力")
     r.check("リセットから10フレーム、クラッシュせずに走る", True)
+
+    # 起動の長さは「起動が重すぎないか」という独立した主張なので、専用の検証にする。
+    # これを DMA やフレームカウンタの検証に混ぜると、起動が延びただけなのに
+    # 「DMA が毎フレーム走っていない」という誤った診断が出る（BOOT_FRAMES_MAX の注記を見よ）。
+    r.check("起動処理が %d フレーム以内に終わる（最初の NMI が来る）" % BOOT_FRAMES_MAX,
+            boot_frames is not None and boot_frames <= BOOT_FRAMES_MAX,
+            "%s。init.s の2回目の VBlank 待ちより後ろ（MMC3 初期化・パレット転送・"
+            "背景1画面ぶんの初期転送・シーン構築・最初の oam_build）が1フレームに収まっていない。"
+            "起動が延びると最初の絵が出るまでの待ちが伸び、さらに「DMA が毎フレーム走る」"
+            "「frame_counter が増える」がこの重さのせいで落ちて原因が読めなくなる。"
+            "伸ばしてよいと判断したなら test/run_tests.py の BOOT_FRAMES_MAX を理由つきで上げること"
+            % ("最初の OAM DMA が %d フレーム目に来た" % boot_frames if boot_frames is not None
+               else "%d フレーム走っても OAM DMA が一度も無い（NMI が来ていない）" % boot_limit))
 
     r.check("NMI が有効になっている", nes.ppu.nmi_enabled,
             "PPUCTRL=$%02X。bit7 が立っていない＝NMI が来ないので、"
@@ -147,10 +226,13 @@ def layer2_execution(rom_path, labels, r):
     r.check("8x16 スプライトモード", bool(nes.ppu.ctrl & 0x20),
             "PPUCTRL=$%02X。本作は 8x16 前提（体格型のタイル割当が変わる）" % nes.ppu.ctrl)
 
-    # 起動直後の2フレームは PPU のウォームアップ（VBlank 2回待ち）に使うため DMA は走らない
-    r.check("OAM DMA が毎フレーム行われている", nes.dma_count >= 8,
-            "10フレームで DMA %d 回（起動の2フレームを除いて8回以上を期待）。"
-            "NMI 中の $4014 書き込みが抜けている" % nes.dma_count)
+    # 起動が終わった**あと**の10フレームで数える。起動にかかるフレーム数は上で別に見ており、
+    # ここは「走り出したら毎フレーム DMA する」という主張だけを見る。
+    r.check("OAM DMA が毎フレーム行われている", nes.dma_count - dma_at_boot == 10,
+            "起動後の10フレームで DMA %d 回（期待はちょうど10回 = 毎フレーム1回）。"
+            "NMI 中の $4014 書き込みが抜けているか、oam_ready が下りたまま NMI を迎えて "
+            "DMA を飛ばしたフレームがある（飛ばしたフレームは1フレーム前の絵が出たままになる）"
+            % (nes.dma_count - dma_at_boot))
     r.check("OAM DMA の転送元が OAM シャドウのページ", nes.oam_dma_page == 0x02,
             "$4014 に $%02X を書いている。OAM シャドウは $0200 に置く" % (nes.oam_dma_page or 0))
 
@@ -179,7 +261,9 @@ def layer2_execution(rom_path, labels, r):
     shadow_base = labels.get("oam_shadow", 0x0200)
     for i in range(OAM_SPRITE_MAX):
         nes.ram[(shadow_base + i * 4) & 0x7FF] = 0x50
-    nes.run_frames(2)
+    # OAM（DMA された完成品）と oam_used（組み立て中の作業変数）を突き合わせるので、
+    # 静止した状態で読む。動いている最中だと、この2つが別々のフレームのものになる。
+    settle(nes)
 
     oam_used_addr = labels.get("oam_used")
     if oam_used_addr is None:
@@ -203,10 +287,11 @@ def layer2_execution(rom_path, labels, r):
                 % used)
 
     if labels and "frame_counter" in labels:
-        fc = nes.ram[labels["frame_counter"] & 0x7FF]
-        r.check("frame_counter が加算されている", fc >= 8,
-                "frame_counter=%d（10フレーム走った後。起動の2フレームは PPU ウォームアップ）。"
-                "NMI が来ていない可能性" % fc)
+        delta = (fc_after - fc_at_boot) & 0xFF
+        r.check("frame_counter が毎フレーム加算されている", delta == 10,
+                "起動後の10フレームで frame_counter が %d しか進んでいない（期待 10）。"
+                "NMI が来ていないフレームがある。※ 起動にかかったフレーム数は別の検証で見ている"
+                % delta)
 
     # 入力 → OAM シャドウ → DMA → OAM の経路
     # OAM は DMA でシャドウを1フレーム遅れて写す。移動の検証はシャドウ側で行い、
@@ -216,24 +301,45 @@ def layer2_execution(rom_path, labels, r):
     def shadow(i):
         return nes.ram[(oam_shadow + i) & 0x7FF]
 
+    # 位置の読み取りは必ず「入力を離して静止させてから」行う（冒頭の SETTLE_FRAMES の注記）。
+    settle(nes)
     base_x = shadow(3)
+
+    # 以下の比較が成り立つ前提そのものを、ここで1回だけ確かめておく。
+    # 静止しているのにフレーム内の観測位置で値が変わるなら、
+    # 下の「右に動く／左に動く／止まる」は**どれも**フレームの処理時間しだいで
+    # 勝手に落ちるテストになる。前提が崩れたときは、その前提の名前で落としたい。
+    phases = sample_phases(nes, lambda: shadow(3))
+    r.check("静止中の OAM シャドウはフレーム内のどこで読んでも同じ値になる",
+            len(set(phases)) == 1,
+            "同じフレームの中で位相をずらして読むと x が %s と揺れた。"
+            "run_frames が戻る位置はメインループが oam_build を走らせている最中なので、"
+            "揺れる状態で読むと「1フレーム古い OAM」を読むことがあり、"
+            "位置を比べるテストの合否がフレームの処理時間に左右される。"
+            "入力を離して静止させてから読むこと" % (phases,))
+
     nes.set_buttons({"RIGHT"})
     nes.run_frames(20)
+    settle(nes)                      # 離してから読む（押しっぱなしのまま読むと観測点に依存する）
     right_x = shadow(3)
     r.check("右キーでスプライトが右に動く", right_x > base_x,
             "OAM シャドウの x: %d -> %d。入力が読めていないか反映されていない" % (base_x, right_x))
 
     nes.set_buttons({"LEFT"})
     nes.run_frames(20)
+    settle(nes)
     left_x = shadow(3)
     r.check("左キーでスプライトが左に動く", left_x < right_x,
             "OAM シャドウの x: %d -> %d" % (right_x, left_x))
 
-    nes.set_buttons(set())
+    # ここは「離した後さらに走らせても1ドットも動かない」ことを見る。
+    # left_x は既に静止状態で読んであるので、両辺が同じ土俵にある。
     nes.run_frames(20)
     r.check("入力なしでスプライトが止まる", shadow(3) == left_x,
             "OAM シャドウの x: %d -> %d。入力を離しても動いている" % (left_x, shadow(3)))
 
+    # OAM は DMA で1フレーム遅れて写るので、この比較が意味を持つのは静止しているときだけ。
+    # 直前の20フレームは入力なしなので、シャドウも OAM も同じ絵を指している。
     r.check("OAM シャドウが DMA で OAM に反映されている",
             list(nes.ppu.oam[0:4]) == [shadow(0), shadow(1), shadow(2), shadow(3)],
             "OAM=%s, シャドウ=%s。$4014 の転送元ページが違う可能性"
@@ -380,6 +486,8 @@ def main(argv=None):
         layer2_execution(args.rom, labels, r)
         print()
         layer2_engine(args.rom, labels, r)
+        print()
+        layer2_scroll(args.rom, labels, r)
     print()
     ran_l3 = layer3_mesen(args.rom, r)
 
