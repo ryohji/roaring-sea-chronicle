@@ -9,6 +9,8 @@
 .import ent_state, ent_class, ent_body, ent_tile, ent_attr
 .import lane_update_all, oam_build, cam_update
 .import action_init, action_update
+.import ai_init, ai_update
+.import ent_ai
 .import stage_w_lo, stage_w_hi
 
 ; --- P1 の動作確認用シーンのパラメータ ---
@@ -22,6 +24,12 @@ PLAYER_EDGE_MARGIN = 16       ; ステージ右端に残す余白（体1つぶ�
 TEST_TILE_FIGURE = 0          ; 仮CHR: タイル0/1 が 8x16 の人型
 TEST_ATTR_PLAYER = 0          ; スプライトパレット0
 TEST_ATTR_ENEMY  = 1          ; スプライトパレット1
+TEST_ATTR_ALLY   = 2          ; スプライトパレット2（仲間）
+ALLY_HOME_X      = PLAYER_HOME_X - 24
+
+; data/ai_params.tsv の id。仮シーンの配置なのでここに置く（本番は data から入る）
+AI_PROFILE_ALLY  = 0          ; ally_versatile
+AI_PROFILE_ENEMY = 1          ; enemy_melee
 TEST_ENEMY_COUNT = 3
 
 .segment "CODE"
@@ -38,6 +46,7 @@ TEST_ENEMY_COUNT = 3
 
         jsr scene_test_init
         jsr action_init         ; HP・状態機械の初期化（scene_test_init がエンティティを置いた後）
+        jsr ai_init             ; 自律行動の初期化（action_init の後）
         jsr oam_build           ; 最初の DMA に間に合うよう1回組んでおく
 
         ; 描画を開始する。値はシャドウが持っている（init_system が決めた）。
@@ -69,6 +78,7 @@ TEST_ENEMY_COUNT = 3
         jsr wait_nmi
         jsr read_pad
         jsr action_update       ; 操作・攻撃・ダウンは src/action/ が持つ
+        jsr ai_update           ; 自律仲間と敵の思考・行動は src/ai/ が持つ
         jsr lane_update_all
         jsr cam_update          ; カメラ追従 + 現れた列を転送キューへ
         jsr oam_build
@@ -110,6 +120,28 @@ TEST_ENEMY_COUNT = 3
         sta ent_state, x
         jsr ent_activate
 
+        ; --- 自律仲間1体（万能型）。P1 の垂直スライスは操作1＋自律1で見る ---
+        ldx #ENT_ALLY_FIRST
+        lda #<ALLY_HOME_X
+        sta ent_x_lo, x
+        lda #>ALLY_HOME_X
+        sta ent_x_hi, x
+        lda #PLAYER_HOME_LANE
+        sta ent_lane, x
+        lda #SPR_CLASS_FAR_ENE
+        sta ent_class, x
+        lda #BODY_PLACEHOLDER
+        sta ent_body, x
+        lda #AI_PROFILE_ALLY
+        sta ent_ai, x
+        lda #TEST_TILE_FIGURE
+        sta ent_tile, x
+        lda #TEST_ATTR_ALLY
+        sta ent_attr, x
+        lda #ENT_ST_IDLE
+        sta ent_state, x
+        jsr ent_activate
+
         ldx #ENT_ENEMY_FIRST
         ldy #0
 @enemy:
@@ -123,6 +155,8 @@ TEST_ENEMY_COUNT = 3
         sta ent_body, x
         lda #SPR_CLASS_FAR_ENE
         sta ent_class, x
+        lda #AI_PROFILE_ENEMY
+        sta ent_ai, x
         lda #TEST_TILE_FIGURE
         sta ent_tile, x
         lda #TEST_ATTR_ENEMY

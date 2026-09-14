@@ -20,7 +20,7 @@ MAP     := $(BUILD)/roaring.map
 LABELS  := $(BUILD)/roaring.labels
 CFG     := cfg/mmc3.cfg
 
-ASFLAGS := -g -I src --bin-include-dir $(CHRDIR)
+ASFLAGS := -g -I src -I src/action -I src/ai --bin-include-dir $(CHRDIR)
 LDFLAGS := -C $(CFG) -m $(MAP) -Ln $(LABELS)
 
 SRCS    := $(shell find src -name '*.s' | sort)
