@@ -25,6 +25,8 @@ from l2_engine import layer2_engine, OAM_SPRITE_MAX  # noqa: E402
 from l2_scroll import (layer2_scroll, check_nmi_write_budget,  # noqa: E402
                        DIAG_COUNTERS)
 from l2_camera import layer2_camera            # noqa: E402
+from l2_ai import layer2_ai                    # noqa: E402
+from scene import disarm_enemies               # noqa: E402
 
 
 ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途のオートセーブ）"
@@ -316,6 +318,14 @@ def layer2_execution(rom_path, labels, r):
     def shadow(i):
         return nes.ram[(oam_shadow + i) & 0x7FF]
 
+    # ここから下の3件が見たいのは「入力 → OAM シャドウ → DMA → OAM」の経路であって、
+    # 戦闘下の挙動ではない。敵が殴るようになって以降、ノックバックで操作キャラが
+    # **入力が無くても動く**ため「入力なしで止まる」が落ちる。これは engine の不具合ではない。
+    # 期待値を「数ドットまでの移動は許す」に緩めると、入力が無いのに動く不具合を
+    # 二度と捕まえられなくなる。邪魔している側（敵の攻撃）を取り除いてから見る。
+    # ノックバックで動くこと自体は仕様であり、l2_ai.py 側で別の主張として見ている。
+    restore_enemies = disarm_enemies(nes, labels)
+
     # 位置の読み取りは必ず「入力を離して静止させてから」行う（冒頭の SETTLE_FRAMES の注記）。
     settle(nes)
     base_x = shadow(3)
@@ -359,6 +369,10 @@ def layer2_execution(rom_path, labels, r):
             list(nes.ppu.oam[0:4]) == [shadow(0), shadow(1), shadow(2), shadow(3)],
             "OAM=%s, シャドウ=%s。$4014 の転送元ページが違う可能性"
             % (list(nes.ppu.oam[0:4]), [shadow(i) for i in range(4)]))
+
+    # 位置を比べる検証はここまで。以降（経路の再生・120フレームの安定性・転送キューの
+    # 診断カウンタ）は**敵が殴ってくる状態**で見たいので、敵を戻す。
+    restore_enemies()
 
     # 経路ファイルの再生（P6 の代表20経路と同じ仕組みを P0 から通しておく）
     route_path = os.path.join(HERE, "routes", "p0_walk.txt")
@@ -521,6 +535,8 @@ def main(argv=None):
         scroll_state = layer2_scroll(args.rom, labels, r) or {}
         print()
         layer2_camera(args.rom, labels, r)
+        print()
+        layer2_ai(args.rom, labels, r)
         print()
         # ここまでの検証が回した**全ての NMI** をまとめて見る。転送量の上限は
         # 抜き取り（混んでいるフレームを20フレーム）では位相しだいで素通りするので、

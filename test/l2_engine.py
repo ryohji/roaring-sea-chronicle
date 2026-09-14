@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(HERE, "harness"))
 from cpu6502 import CpuCrash                  # noqa: E402
 from nes import (Nes, VBLANK_CYCLES, boot,          # noqa: E402
                  frame_end, step_frame, frame_instructions)
+from scene import disarm_enemies                    # noqa: E402
 
 # --- src/constants.inc と対応する値。ここに無いものは ROM かラベルから導出する ---
 OAM_SPRITE_MAX = 64          # PPU のハード制約（OAM は 64 エントリ）
@@ -256,6 +257,16 @@ def _monotone_problem(samples, target):
 def _check_lane_interpolation(nes, labels, ents, lane_y, r):
     r.section("レーン移動（補間とクランプ）")
 
+    # ここで見たいのは engine の**レーン補間とクランプ**であって、戦闘下の挙動ではない。
+    # 敵が殴るようになって以降、UP/DOWN を叩いた瞬間に操作キャラがのけぞり／
+    # ヒットストップに居ると入力が通らず、この節は engine が正しいまま落ちる。
+    # 期待値を緩めて戦闘下でも通るようにするのは**テストを緩めること**なので、
+    # 邪魔している側（敵の攻撃）を取り除いてから駆動する。
+    # 「のけぞり中は入力を受け付けない」ことは別の主張として l2_ai.py で見ている。
+    # 仲間は残す（仲間が操作キャラのレーンや座標に手を出していたら、ここで落ちてほしい）。
+    restore_enemies = disarm_enemies(nes, labels)
+    step_frame(nes, labels)          # 取り除いた結果を1フレームぶん落ち着かせる
+
     start_lane = ents.peek("ent_lane", 0)
     if not 0 <= start_lane < LANE_COUNT - 1:
         r.check("操作キャラ (#0) が起動時に有効なレーンに居る", False,
@@ -392,6 +403,8 @@ def _check_lane_interpolation(nes, labels, ents, lane_y, r):
             "%s。最終 lane=%d y=%d（期待 lane=%d y=%d）"
             % ("／".join(problems) or "問題なし", ents.peek("ent_lane", 0),
                ents.peek("ent_y", 0), LANE_COUNT - 1, lane_y[-1]))
+
+    restore_enemies()        # 以降の節は敵の居る状態に戻して見る
 
 
 # ---------------------------------------------------------------- NMI の分担

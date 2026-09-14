@@ -234,6 +234,9 @@ class CallResult:
 
 
 class Nes:
+    # 空回り検出の間隔（命令数）。run_cycles の注記を見よ。
+    IDLE_SAMPLE = 48
+
     def __init__(self, rom_path, prg_ram_fill=0x00):
         """prg_ram_fill: 電源投入時の PRG-RAM の中身（1バイト or bytes）。
 
@@ -275,6 +278,8 @@ class Nes:
         self._nmi_stack = []
         self.nmi_data_writes = None     # 直近の NMI が $2007 に書いたバイト数
         self.nmi_data_writes_max = 0    # この Nes で観測した最大値
+        self.bus_events = 0             # 副作用のある読み書きの回数（空回り検出に使う）
+        self.idle_skips = 0             # 空回りを飛ばした回数（診断用）
 
     # ---- NMI の出入り（cpu6502 が呼ぶ。$2007 の書き込み数を NMI ごとに数えるため）----
     def on_nmi_enter(self):
@@ -313,9 +318,17 @@ class Nes:
         self.cpu.reset()
 
     # ---- バス ----
+    # bus_events は「読み書きによって機械の状態が変わった回数」である。
+    # run_cycles の空回り検出（下記 IDLE_SAMPLE）がこれを見て
+    # 「この 48 命令は何の痕跡も残していない」と判定する。
+    # 数えるのは *書き込み全部* と、*読むだけで状態が変わる番地*（$2000-$7FFF）だけ。
+    # RAM と ROM の読み出しは副作用が無いので数えない（数えると命令フェッチで埋まる）。
     def read(self, addr):
         if addr < 0x2000:
             return self.ram[addr & 0x7FF]
+        if addr >= 0x8000:
+            return self.mapper.read(addr)         # ROM。読んでも何も変わらない
+        self.bus_events += 1
         if addr < 0x4000:
             return self.ppu.read(addr & 7)
         if addr == 0x4016:
@@ -331,6 +344,7 @@ class Nes:
         return self.mapper.read(addr)
 
     def write(self, addr, value):
+        self.bus_events += 1
         if self.write_log is not None:
             self.write_log.append((addr, value))
         if addr < 0x2000:
@@ -370,11 +384,41 @@ class Nes:
         self.cpu.reset()
 
     def run_cycles(self, count, budget_instructions=2_000_000):
-        target = self.cpu.cycles + count
+        """count サイクルぶん進める。空回り（wait_nmi の待ちループ）は飛ばす。
+
+        メインループは1フレームの仕事を終えたあと wait_nmi で NMI を待って回り続ける。
+        実測でその待ちが**1フレームの命令の 82%**（9101 命令のうち 7455）を占めており、
+        1命令ずつ回すとテスト全体の実行時間の大半がこの空回りに消える。
+
+        飛ばしてよい条件は厳密に置く: IDLE_SAMPLE 命令の前後で
+        **CPU のレジスタ・PC・スタックポインタ・フラグが全て同じで、かつ
+        その間に bus_events が1つも増えていない**なら、機械の状態は
+        IDLE_SAMPLE 命令前と完全に同一である（RAM も PPU も変わっていない）。
+        同じ状態からは同じことが起きるので、割り込みが来るまで永久にこれを繰り返す。
+        つまりサイクルを目標まで進めるのと観測上まったく区別がつかない。
+
+        IDLE_SAMPLE を 48 にしてあるのは、長さ 1,2,3,4,6,8,12,16 命令の待ちループを
+        取りこぼさない（48 がその倍数である）ためである。
+
+        **ハングの検出はここの仕事ではない。**サイクルは空回りでも進むので、
+        この関数の命令数の上限（budget_instructions）は元々1フレームでは到達しない。
+        「1フレームぶんの更新が終わらない」は frame_end() が、
+        「NMI が rti に来ない」は _run_nmi_handler() が名指しで捕まえる。
+        """
+        cpu = self.cpu
+        target = cpu.cycles + count
         executed = 0
-        while self.cpu.cycles < target:
-            self.cpu.step()
+        mark = None
+        while cpu.cycles < target:
+            cpu.step()
             executed += 1
+            if executed % self.IDLE_SAMPLE == 0:
+                state = (cpu.pc, cpu.a, cpu.x, cpu.y, cpu.sp, cpu.p, self.bus_events)
+                if state == mark:
+                    self.idle_skips += 1
+                    cpu.cycles = target       # 割り込みが来るまで何も起きない
+                    return
+                mark = state
             if executed > budget_instructions:
                 raise CpuCrash("1フレーム内で命令数の上限を超えた（無限ループの疑い）: PC=$%04X"
                                % self.cpu.pc)
