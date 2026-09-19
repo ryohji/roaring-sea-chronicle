@@ -48,6 +48,14 @@ spr_y:         .res 1
 spr_tile:      .res 1
 spr_attr:      .res 1
 spr_cols:      .res 1
+spr_tstep:     .res 1
+
+fx_arg_x_lo:   .res 1
+fx_arg_x_hi:   .res 1
+fx_arg_y:      .res 1
+fx_arg_tile:   .res 1
+fx_arg_attr:   .res 1
+fx_arg_life:   .res 1
 
 rect_a:        .res RECT_SIZE
 rect_b:        .res RECT_SIZE

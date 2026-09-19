@@ -63,8 +63,19 @@ ZEROPAGE_INC = 1
 .globalzp spr_x_lo, spr_x_hi ; 展開中スプライトの画面X（16bit。範囲外の切り捨て判定に使う）
 .globalzp spr_y              ; 展開中スプライトの OAM Y バイト
 .globalzp spr_tile           ; 展開中スプライトのタイル番号
-.globalzp spr_attr           ; 展開中スプライトの属性バイト
+.globalzp spr_attr           ; 展開中スプライトの属性バイト（水平反転を載せ済み）
 .globalzp spr_cols           ; 残り列数
+.globalzp spr_tstep          ; 列を1つ進めるときのタイル番号の増分（+2 / 右向き、-2 / 左向き）
+
+; --- 短命の効果スプライトの引数（src/engine/fx.s）---
+; fx_spawn を呼ぶ前にここへ詰める。呼び出しをまたいで保つ必要はない
+; （fx_spawn が枠へ写し取るまでの受け渡しにしか使わない）。
+; 使うのは action-dev / ai-dev である。engine は「出す仕組み」までしか持たない。
+.globalzp fx_arg_x_lo, fx_arg_x_hi   ; ワールドX（16bit）
+.globalzp fx_arg_y                   ; 足元（接地線）の画面Y。レーンから引くなら lane_y_of
+.globalzp fx_arg_tile                ; タイル番号（SPR_TILE_*。偶数であること）
+.globalzp fx_arg_attr                ; OAM 属性（パレットと反転。SPR_PAL_EFFECT が既定）
+.globalzp fx_arg_life                ; 寿命（フレーム数。1 以上）
 
 ; --- 矩形交差の引数（src/engine/collide.s）---
 ; オフセットは constants.inc の RECT_*。呼び出し側がここに詰めて rect_overlap を呼ぶ。

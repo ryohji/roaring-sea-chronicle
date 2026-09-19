@@ -8,6 +8,7 @@
 .import ent_x_lo, ent_x_hi, ent_lane, ent_lane_step
 .import ent_state, ent_class, ent_body, ent_tile, ent_attr
 .import lane_update_all, oam_build, cam_update
+.import fx_clear_all, fx_update
 .import action_init, action_update
 .import ai_init, ai_update
 .import ent_ai
@@ -21,11 +22,13 @@ PLAYER_HOME_X    = 120
 PLAYER_HOME_LANE = 2
 PLAYER_SPEED     = 1          ; 手触りの値ではない。動きが見えればよい
 PLAYER_EDGE_MARGIN = 16       ; ステージ右端に残す余白（体1つぶん）
-; 仮CHR のタイル割当（tools/mk_placeholder_chr.py と対応）。
-; 役割ごとに輪郭の違う絵を割り当てる。色だけで見分けさせない。
-TILE_PLAYER = 0               ; 操作キャラ 6姿勢 (0,2,4,6,8,10)
-TILE_ALLY   = 16              ; 仲間
-TILE_ENEMY  = 32              ; 敵
+; 仮CHR のタイル割当は src/constants.inc の SPR_ROLE_* が持つ
+; （tools/mk_placeholder_chr.py と対応）。役割ごとに輪郭の違う絵を割り当てる。
+; 色だけで見分けさせない。ent_activate が先頭タイルを ent_tile0 に覚えるので、
+; 以降の姿勢の切り替えは ent_set_pose で済む（姿勢を選ぶのは action-dev / ai-dev）。
+TILE_PLAYER = SPR_ROLE_PLAYER
+TILE_ALLY   = SPR_ROLE_ALLY
+TILE_ENEMY  = SPR_ROLE_ENEMY
 TEST_ATTR_PLAYER = 0          ; スプライトパレット0
 TEST_ATTR_ENEMY  = 1          ; スプライトパレット1
 TEST_ATTR_ALLY   = 2          ; スプライトパレット2（仲間）
@@ -81,6 +84,7 @@ TEST_ENEMY_COUNT = 3
 @frame:
         jsr wait_nmi
         jsr read_pad
+        jsr fx_update           ; 短命の効果の寿命。**action / ai が出す前に**減らす
         jsr action_update       ; 操作・攻撃・ダウンは src/action/ が持つ
         jsr ai_update           ; 自律仲間と敵の思考・行動は src/ai/ が持つ
         jsr lane_update_all
@@ -104,6 +108,7 @@ TEST_ENEMY_COUNT = 3
 ; 敵の思考（AI）は ai-dev の範囲なので書かない。ここでは「置くだけ」である。
 .proc scene_test_init
         jsr ent_clear_all
+        jsr fx_clear_all
 
         ldx #ENT_PLAYER
         lda #<PLAYER_HOME_X

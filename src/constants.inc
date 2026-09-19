@@ -238,6 +238,56 @@ BODY_TYPE_COUNT  = 6
 SPRITE_W = 8
 SPRITE_H = 16
 
+; ---- OAM 属性バイト（ent_attr / fx_attr の中身）----
+; 下位2bit がパレット。bit5 が背景の後ろ、bit6 が水平反転、bit7 が垂直反転。
+; bit2..4 は PPU が使わない（書いても無視される）ので、そこを engine の印に使う。
+ENT_ATTR_PAL    = %00000011   ; スプライトパレット 0..3
+ENT_ATTR_BEHIND = %00100000   ; 背景の後ろに描く
+ENT_ATTR_HFLIP  = %01000000   ; 水平反転。**ここを書くのは engine だけ**（下記）
+ENT_ATTR_VFLIP  = %10000000   ; 垂直反転
+; 足元に影を敷くか。**PPU が無視する bit2 に載せてある**ので、そのまま OAM へ
+; 流れても害は無いが、emit では ENT_ATTR_OAM_MASK で落としてから書く。
+; 既定は「敷く」: ent_activate が有効化のときにこのビットを立てる。
+; 敷きたくないもの（効果・飛び道具など、接地していないもの）だけが下ろす。
+ENT_ATTR_SHADOW = %00000100
+; ent_attr のうち OAM にそのまま流してよいビット。
+; 水平反転 (bit6) を落としてあるのは、**向きの出どころを act_face 1箇所にする**ためである。
+; ent_attr にも反転が入れられると、「向いている方向」が2箇所から決まることになり、
+; どちらが勝つかは emit の書き順しだいになる。engine は必ず act_face から作り直す。
+ENT_ATTR_OAM_MASK = ENT_ATTR_VFLIP | ENT_ATTR_BEHIND | ENT_ATTR_PAL
+
+; ---- 仮CHR のタイル割当（chr/sprites.png / tools/mk_placeholder_chr.py と対応）----
+; 役割ごとに 16 タイル（= 8x16 が 8 体ぶん）を取り、先頭から姿勢が2タイル刻みで並ぶ。
+;   ent_tile = 役割の先頭タイル + 姿勢 * SPR_POSE_STRIDE
+; 役割の先頭タイルは ent_tile0 が覚えている（src/engine/entity.s）。姿勢の差し替えは
+; ent_set_pose を呼べばよく、呼び出し側が役割の先頭タイルを覚え直す必要はない。
+SPR_ROLE_PLAYER = 0           ; 操作キャラ
+SPR_ROLE_ALLY   = 16          ; 仲間
+SPR_ROLE_ENEMY  = 32          ; 敵
+
+; 姿勢。**全ポーズが右向きで描いてある**。左向きは OAM の水平反転で作る。
+SPR_POSE_STRIDE = 2           ; 8x16 スプライト1体ぶん = 2タイル
+SPR_POSE_STAND  = 0           ; 立ち
+SPR_POSE_WALK   = 1           ; 歩き
+SPR_POSE_GUARD  = 2           ; 構え（沈む）
+SPR_POSE_STRIKE = 3           ; 斬り（前へ倒れる）
+SPR_POSE_HURT   = 4           ; のけぞり（後ろへ折れる）
+SPR_POSE_DOWN   = 5           ; ダウン（接地線の上だけ）
+SPR_POSE_COUNT  = 6
+
+; 効果タイル。役割の絵ではないので姿勢の並びには属さない。
+SPR_TILE_SHADOW = 48          ; 影。接地線（足元Y）に合わせて敷く
+SPR_TILE_SWIPE  = 50          ; 斬り。攻撃の届く位置に出す
+SPR_TILE_IMPACT = 52          ; 衝撃。当たった位置に出す
+SPR_TILE_BOX    = 54          ; 判定枠（デバッグ用）
+SPR_PAL_EFFECT  = 3           ; 影と効果が使うスプライトパレット（src/init.s の palette_data）
+
+; ---- 短命の効果スプライト（src/engine/fx.s）----
+; **エンティティではない**。当たり判定にも AI の走査にも混ざらない。
+; 出すのは action-dev / ai-dev、消すのは engine（寿命が尽きたら自動で消える）。
+; 枠数は OAM の余りで足りる数にしてある。溢れたぶんは黙って出ない（効果は消えてよい）。
+FX_MAX = 6
+
 ; エンティティの Y は「足元（接地線）の画面Y」である。奥行きの前後関係は
 ; この値の大小で決まるので、描画の基準点を足元に置いておくと並べ替えが素直になる。
 ; OAM の Y バイトは実際の表示より1ライン上にずれる仕様なので、その1も含めて引く。
