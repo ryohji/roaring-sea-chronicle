@@ -1,6 +1,11 @@
-"""L2 実行検証 — engine P1 前半（4レーン座標系 / エンティティテーブル / OAM 割当 / 当たり判定）。
+"""L2 実行検証 — engine P1（連続の奥行き / エンティティ表 / OAM 割当 / 向き・影・効果 / 当たり判定）。
 
 run_tests.py から呼ばれる。層の分け方は ADR-0004 に従う。
+
+**レーンは ADR-0009 で廃止した。** 奥行きは連続であり、その実体は足元Y（ent_y）である。
+量子化・補間・補間中の入力破棄・レーン一致判定を見ていた検証は、主張そのものが
+消えたので削除した（何を消したかは ADR-0009 §帰結 qa-runner）。
+代わりに見るのは「歩ける帯の上下限」「足元Yの距離」である。
 
 ここで検証してよいのは「値」であって「タイミング」ではない。
 1スキャンライン8スプライト制約によるちらつき、MMC3 IRQ の分割位置、
@@ -8,9 +13,12 @@ run_tests.py から呼ばれる。層の分け方は ADR-0004 に従う。
 再現していないので検証できない。それらは L3（Mesen2）と実機に回すこと（ADR-0002 / ADR-0004）。
 
 方針:
-  * 期待値は極力 ROM の表そのもの（lane_ground_y / body_width）から読む。
-    主がパラメータ（LANE_MOVE_FRAMES やレーンY）を調整したときに、
-    仕様が壊れていないのにテストが落ちる、という事態を避けるため。
+  * 期待値は ROM の表（body_width / depth_y_min / depth_y_max）と src/*.inc の定数
+    （test/srcdefs.py が読む）から導く。**テスト側に数値を焼き付けない。**
+    主がパラメータ（奥行きの速さ・歩ける帯）を調整したときに、仕様が壊れていないのに
+    テストが落ちる、という事態を避けるため。
+  * ラベルが欠けたときは**それを使う節だけ**が落ちる（test/gate.py）。
+    以前は層の先頭でまとめて検査していたため、1つの名前替えで44件が黙って消えた。
   * 失敗メッセージは「何が期待と違い、何が壊れている疑いがあるか」を1行で書く。
 """
 import os
@@ -18,35 +26,46 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "harness"))
+sys.path.insert(0, HERE)
 
 from cpu6502 import CpuCrash                  # noqa: E402
-from nes import (Nes, VBLANK_CYCLES, boot,          # noqa: E402
-                 frame_end, step_frame, frame_instructions)
+from nes import Nes, VBLANK_CYCLES, boot, frame_end   # noqa: E402
 from scene import disarm_enemies                    # noqa: E402
+from gate import Gate, run_sections, boot_or_fail   # noqa: E402
+from srcdefs import action_defs                     # noqa: E402
 
-# --- src/constants.inc と対応する値。ここに無いものは ROM かラベルから導出する ---
+# --- 値の出どころ ---
+# src/constants.inc の定数は srcdefs が読む（テスト側に焼き付けない）。
+# OAM のエントリ数だけは PPU のハード制約なので、ここに持っていてよい。
 OAM_SPRITE_MAX = 64          # PPU のハード制約（OAM は 64 エントリ）
 OAM_Y_OFFSCREEN = 0xFF
 ENT_ACTIVE = 0x80
 ENT_INACTIVE = 0x00
-ENT_Y_TO_OAM = 17            # SPRITE_H + 1。足元Y → OAM の Y バイト
-SPRITE_W = 8
-LANE_COUNT = 4               # 4固定。ADR なしに変えてはならない（CLAUDE.md 第5条）
-SPR_CLASS_PLAYER = 0
-SPR_CLASS_PROJECT = 1
-SPR_CLASS_NEAR_ENE = 2
-SPR_CLASS_FAR_ENE = 3
-SPR_CLASS_EFFECT = 4
 
-ENT_FIELDS = ("ent_active", "ent_x_lo", "ent_x_hi", "ent_y", "ent_lane", "ent_lane_from",
-              "ent_lane_step", "ent_lane_acc", "ent_lane_dy", "ent_state", "ent_class",
+D = action_defs()            # src/constants.inc + src/action/*.inc の定数
+ENT_Y_TO_OAM = D["ENT_Y_TO_OAM"]      # SPRITE_H + 1。足元Y → OAM の Y バイト
+SPRITE_W = D["SPRITE_W"]
+SPRITE_H = D["SPRITE_H"]
+SORT_KEY_DEPTH_SHIFT = D["SORT_KEY_DEPTH_SHIFT"]
+SPR_CLASS_PLAYER = D["SPR_CLASS_PLAYER"]
+SPR_CLASS_PROJECT = D["SPR_CLASS_PROJECT"]
+SPR_CLASS_NEAR_ENE = D["SPR_CLASS_NEAR_ENE"]
+SPR_CLASS_FAR_ENE = D["SPR_CLASS_FAR_ENE"]
+SPR_CLASS_EFFECT = D["SPR_CLASS_EFFECT"]
+ENT_ATTR_SHADOW = D["ENT_ATTR_SHADOW"]
+ENT_ATTR_HFLIP = D["ENT_ATTR_HFLIP"]
+ENT_ATTR_OAM_MASK = D["ENT_ATTR_OAM_MASK"]
+SPR_POSE_STRIDE = D["SPR_POSE_STRIDE"]
+SPR_POSE_COUNT = D["SPR_POSE_COUNT"]
+SPR_TILE_SHADOW = D["SPR_TILE_SHADOW"]
+
+# ent_active..ent_attr は「MAX_ENTITIES ごとに並ぶ」区間である（entity.s の注記）。
+# ent_tile0 は**その後ろ**に置く約束なので、この並びには入れない。
+ENT_FIELDS = ("ent_active", "ent_x_lo", "ent_x_hi", "ent_y", "ent_state", "ent_class",
               "ent_body", "ent_ai", "ent_tile", "ent_attr")
 
-NEEDED = ENT_FIELDS + (
-    "oam_build", "oam_sort_order", "oam_order", "oam_used", "oam_dropped", "oam_next",
-    "sort_count", "oam_shadow", "cam_x_lo", "cam_x_hi",
-    "rect_overlap", "rect_a", "rect_b", "lane_distance", "lane_ground_y", "body_width",
-    "wait_nmi")
+# 足場（シーンを組み立てて OAM を作る）に要るラベル。ここが欠けたときだけ層ごと諦める。
+CORE = ENT_FIELDS + ("oam_build", "oam_used", "oam_shadow", "cam_x_lo", "cam_x_hi", "wait_nmi")
 
 RECT_X_LO, RECT_X_HI, RECT_Y, RECT_W, RECT_H = 0, 1, 2, 3, 4
 
@@ -69,19 +88,24 @@ class Entities:
     def clear(self):
         for i in range(self.count):
             self.poke("ent_active", i, ENT_INACTIVE)
-            self.poke("ent_lane_step", i, 0)
 
-    def place(self, i, x=0, y=196, cls=SPR_CLASS_FAR_ENE, body=0, tile=0, attr=0, lane=0):
+    def place(self, i, x=0, y=196, cls=SPR_CLASS_FAR_ENE, body=0, tile=0, attr=0, face=0):
+        """エンティティを1体置く。**奥行きは y（足元Y）そのもの**である（ADR-0009）。
+
+        向き（act_face）まで面倒を見るのは、OAM の属性バイトが act_face から
+        作り直されるため（sprite.s）。置く側が向きを決めておかないと、
+        前の検証が残した向きで絵が裏返り、**engine が正しいまま落ちる**検証になる。
+        """
         self.poke("ent_active", i, ENT_ACTIVE)
         self.poke("ent_x_lo", i, x & 0xFF)
         self.poke("ent_x_hi", i, (x >> 8) & 0xFF)
         self.poke("ent_y", i, y)
-        self.poke("ent_lane", i, lane)
-        self.poke("ent_lane_step", i, 0)
         self.poke("ent_class", i, cls)
         self.poke("ent_body", i, body)
         self.poke("ent_tile", i, tile)
         self.poke("ent_attr", i, attr)
+        if "act_face" in self.labels:
+            self.poke("act_face", i, face)
 
 
 def shadow_entry(nes, labels, index):
@@ -102,24 +126,6 @@ def set_camera(nes, labels, x):
     nes.ram[labels["cam_x_hi"] & 0x7FF] = (x >> 8) & 0xFF
 
 
-def tap(nes, labels, button):
-    """1フレームだけ押して離し、そのフレームの更新が終わった点で止める。
-
-    run_frames が戻る位置はメインループが1フレームぶんの更新を走らせている**最中**なので、
-    そこで止めると、読む相手によって「1フレーム古い値」と「更新の途中の値」の
-    どちらにも転ぶ。step_frame() でフレームの更新が終わった点まで進めてから返すことで、
-    この直後に読む値を「押した1フレームぶんの更新を終えた状態」に固定する
-    （作業変数の読み方は harness/nes.py 冒頭の「観測の作法」を見よ）。
-
-    したがって、この直後の読みは **一様に1フレーム遅れる**こともなければ、
-    更新の途中を覗くこともない。ent_lane_step のような作業変数を読んでよい。
-    """
-    nes.set_buttons({button})
-    nes.run_frames(1)
-    nes.set_buttons(set())
-    frame_end(nes, labels)
-
-
 def table_length(labels, name):
     """ラベル name から、その次に来るラベルまでの距離を表の項数とみなす。"""
     addr = labels[name]
@@ -128,14 +134,13 @@ def table_length(labels, name):
 
 
 # ---------------------------------------------------------------- 入口
+# 節ごとに「その節が使うラベル」を宣言する。欠けたラベルを使う節だけが落ち、
+# 残りは走る（test/gate.py の冒頭に理由を書いた）。
 def layer2_engine(rom_path, labels, r):
-    print("L2 実行検証 / engine P1 前半（レーン・エンティティ・OAM・当たり判定）")
+    print("L2 実行検証 / engine P1（奥行き・エンティティ・OAM・向き・影・効果・当たり判定）")
 
-    missing = [n for n in NEEDED if n not in labels]
-    if missing:
-        r.check("engine のラベルが build/roaring.labels に揃っている", False,
-                "ラベルが無い: %s。.export が消えたか、モジュールがリンクから外れている。"
-                "このセクションの検証はラベル無しでは書けないので全部飛ばした" % ", ".join(missing))
+    gate = Gate(labels, r, "engine")
+    if not boot_or_fail(gate, CORE, "エンティティ表の読み書きと OAM の組み立てに使う"):
         return
 
     try:
@@ -153,262 +158,64 @@ def layer2_engine(rom_path, labels, r):
         return
 
     ents = Entities(nes, labels)
-    lane_y = [nes.read(labels["lane_ground_y"] + i) for i in range(LANE_COUNT)]
 
-    if not _check_table_layout(nes, labels, ents, lane_y, r):
-        return
-    for name, fn in (("レーン移動", _check_lane_interpolation),
-                     ("NMI の分担", _check_nmi_budget),
-                     ("OAM 並べ替え", _check_sort_order),
-                     ("OAM 展開", _check_oam_emit),
-                     ("rect_overlap", _check_rect_overlap),
-                     ("lane_distance", _check_lane_distance)):
-        try:
-            if fn in (_check_nmi_budget, _check_rect_overlap, _check_lane_distance):
-                fn(nes, labels, r)
-            elif fn is _check_oam_emit:
-                fn(nes, labels, ents, r)
-            else:
-                fn(nes, labels, ents, lane_y, r)
-        except CpuCrash as e:
-            r.check("%s の検証中にクラッシュしない" % name, False, str(e))
-        except Exception as e:      # noqa: BLE001 — 検証が例外で死ぬと原因が読めなくなる
-            r.check("%s の検証が最後まで走る" % name, False,
-                    "検証コードが %s で止まった: %s。engine の値が想定の範囲を外れている "
-                    "（テーブルの外を指すレーン番号・体格 ID など）疑いがある"
-                    % (type(e).__name__, e))
+    sections = (
+        ("テーブルの前提", (), _check_table_layout),
+        ("歩ける帯（奥行きの上下限）",
+         ("depth_y_min", "depth_y_max", "depth_set_band", "depth_clamp"), _check_depth_band),
+        ("ent_depth_move", ("ent_depth_move", "depth_y_min", "depth_y_max"),
+         _check_ent_depth_move),
+        ("depth_distance", ("depth_distance",), _check_depth_distance),
+        ("NMI の分担", ("oam_order", "oam_next", "sort_count", "oam_dropped"),
+         _check_nmi_budget),
+        ("OAM 並べ替え", ("oam_sort_order", "oam_order", "sort_count", "oam_sortkey_guard",
+                         "depth_y_min", "depth_y_max"), _check_sort_order),
+        ("OAM 展開", ("body_width", "oam_dropped"), _check_oam_emit),
+        ("向き（水平反転）", ("act_face", "body_width"), _check_facing),
+        ("影", ("body_width", "oam_fx_dropped", "oam_dropped", "ent_activate"), _check_shadow),
+        ("効果スプライト (fx)",
+         ("fx_spawn", "fx_update", "fx_clear_all", "fx_life", "fx_x_lo", "fx_x_hi",
+          "fx_y", "fx_tile", "fx_attr", "fx_arg_x_lo", "fx_arg_x_hi", "fx_arg_y",
+          "fx_arg_tile", "fx_arg_attr", "fx_arg_life"), _check_fx),
+        ("姿勢 (ent_set_pose)", ("ent_set_pose", "ent_tile0", "ent_activate"), _check_pose),
+        ("rect_overlap", ("rect_overlap", "rect_a", "rect_b"), _check_rect_overlap),
+    )
+    run_sections(gate, sections, lambda fn: (nes, labels, ents, r))
 
 
 # ---------------------------------------------------------------- 前提の確認
-def _check_table_layout(nes, labels, ents, lane_y, r):
-    """以降の検証が寄りかかっている前提（配列長とレーン表）を先に確かめる。"""
+def _check_table_layout(nes, labels, ents, r):
+    """以降の検証が寄りかかっている前提（SoA の配列長）を先に確かめる。"""
     r.section("テーブルの前提")
 
     strides = {}
     for a, b in zip(ENT_FIELDS, ENT_FIELDS[1:]):
         strides[(a, b)] = labels[b] - labels[a]
     bad = ["%s→%s が %d" % (a, b, d) for (a, b), d in strides.items() if d != ents.count]
-    ok = r.check("エンティティ配列が MAX_ENTITIES(%d) ごとに並んでいる" % ents.count, not bad,
-                 "%s（期待はすべて %d）。SoA の配列長が揃っていないと "
-                 "`lda ent_y, x` の x が別の属性を指す。entity.s の .res の並びを見よ"
-                 % ("、".join(bad), ents.count))
+    r.check("エンティティ配列が MAX_ENTITIES(%d) ごとに並んでいる" % ents.count, not bad,
+            "%s（期待はすべて %d）。SoA の配列長が揃っていないと "
+            "`lda ent_y, x` の x が別の属性を指す。entity.s の .res の並びを見よ"
+            % ("、".join(bad), ents.count))
 
-    ok &= r.check("レーン数が %d 固定である" % LANE_COUNT, ents.count > 0 and len(lane_y) == LANE_COUNT,
-                  "lane_ground_y の項数が %d でない。レーン数の変更は ADR が要る"
-                  "（CLAUDE.md 第5条）" % LANE_COUNT)
+    r.check("MAX_ENTITIES がラベルの間隔と constants.inc で一致する (%d)" % ents.count,
+            ents.count == D["MAX_ENTITIES"],
+            "ラベルの間隔は %d だが constants.inc の MAX_ENTITIES は %d。"
+            "テストがエンティティ表の長さを取り違えており、以降の「全スロットに置く」系の"
+            "検証が表からはみ出すか、途中までしか見ない"
+            % (ents.count, D["MAX_ENTITIES"]))
 
-    ok &= r.check("lane_ground_y が奥→手前で単調増加する %s" % (lane_y,),
-                  all(lane_y[i] < lane_y[i + 1] for i in range(LANE_COUNT - 1)),
-                  "lane_ground_y=%s。レーン0が最も奥（画面上方）、レーン%d が最も手前という "
-                  "前提が崩れると、奥行きの並べ替え（足元Y降順）が前後を逆に描く"
-                  % (lane_y, LANE_COUNT - 1))
-
-    ok &= r.check("レーンの足元Yが画面内かつ OAM に変換できる範囲にある",
-                  all(ENT_Y_TO_OAM <= y < 0xEF for y in lane_y),
-                  "lane_ground_y=%s。%d 未満のレーンは OAM の Y 計算で借りが出て描画されず、"
-                  "$EF 以上は画面外" % (lane_y, ENT_Y_TO_OAM))
-    return ok
-
-
-# ---------------------------------------------------------------- レーン補間
-def _slide(nes, labels, ents, button, max_frames=90):
-    """button を1フレーム押し、レーン補間が終わるまで走らせる。
-
-    戻り値: (各フレームの ent_y の列, かかったフレーム数)。
-    LANE_MOVE_FRAMES を期待値に焼き付けない（主が手触りを調整したときに落ちないように）ため、
-    「ent_lane_step が 0 に戻るまで」で待つ。
-
-    待ちの条件に使う ent_lane_step も、集める ent_y も、フレームの更新が終わった点
-    （step_frame）で読む。生の run_frames の戻り位置で読むと、到着したフレームだけは
-    lane_step_one の到着処理の**途中** — dec ent_lane_step で step が 0 になった直後、
-    足元Yの吸着と acc/dy の消去がまだ済んでいない点 — で抜けてしまい、
-    「移動後の状態」を名乗れない値を持ち帰る（harness/nes.py 冒頭「観測の作法」(b)）。
-    """
-    samples = [ents.peek("ent_y", 0)]
-    tap(nes, labels, button)
-    samples.append(ents.peek("ent_y", 0))
-    frames = 1
-    while ents.peek("ent_lane_step", 0) != 0 and frames < max_frames:
-        step_frame(nes, labels)
-        samples.append(ents.peek("ent_y", 0))
-        frames += 1
-    return samples, frames
-
-
-def _monotone_problem(samples, target):
-    """samples が目標へ単調に近づき、行き過ぎずに到達しているかを調べる。問題文字列 or None。"""
-    start = samples[0]
-    if target == start:
-        return None
-    step = 1 if target > start else -1
-    for i in range(1, len(samples)):
-        delta = samples[i] - samples[i - 1]
-        if delta * step < 0:
-            return ("%d フレーム目で %d → %d と逆戻りした" % (i, samples[i - 1], samples[i]))
-        if step > 0 and samples[i] > target:
-            return ("%d フレーム目に %d まで進んで目標 %d を行き過ぎた" % (i, samples[i], target))
-        if step < 0 and samples[i] < target:
-            return ("%d フレーム目に %d まで戻って目標 %d を行き過ぎた" % (i, samples[i], target))
-    if samples[-1] != target:
-        return ("最後の値が %d で、目標 %d に届いていない" % (samples[-1], target))
-    return None
-
-
-def _check_lane_interpolation(nes, labels, ents, lane_y, r):
-    r.section("レーン移動（補間とクランプ）")
-
-    # ここで見たいのは engine の**レーン補間とクランプ**であって、戦闘下の挙動ではない。
-    # 敵が殴るようになって以降、UP/DOWN を叩いた瞬間に操作キャラがのけぞり／
-    # ヒットストップに居ると入力が通らず、この節は engine が正しいまま落ちる。
-    # 期待値を緩めて戦闘下でも通るようにするのは**テストを緩めること**なので、
-    # 邪魔している側（敵の攻撃）を取り除いてから駆動する。
-    # 「のけぞり中は入力を受け付けない」ことは別の主張として l2_ai.py で見ている。
-    # 仲間は残す（仲間が操作キャラのレーンや座標に手を出していたら、ここで落ちてほしい）。
-    restore_enemies = disarm_enemies(nes, labels)
-    step_frame(nes, labels)          # 取り除いた結果を1フレームぶん落ち着かせる
-
-    start_lane = ents.peek("ent_lane", 0)
-    if not 0 <= start_lane < LANE_COUNT - 1:
-        r.check("操作キャラ (#0) が起動時に有効なレーンに居る", False,
-                "ent_lane=%d。有効なのは 0..%d で、この検証は下へ1つ動ける位置から始める"
-                % (start_lane, LANE_COUNT - 1))
-        return
-    r.check("操作キャラ (#0) が起動時にレーン表どおりの足元Yに居る (レーン%d)" % start_lane,
-            ents.peek("ent_y", 0) == lane_y[start_lane],
-            "ent_y=%d だが lane_ground_y[%d]=%d。ent_activate がレーンから足元Yを決めていない"
-            % (ents.peek("ent_y", 0), start_lane, lane_y[start_lane]))
-
-    # --- DOWN 1回: 手前のレーンへ補間で移動する ---
-    samples, frames = _slide(nes, labels, ents, "DOWN")
-    target_lane = start_lane + 1
-    target_y = lane_y[target_lane]
-
-    r.check("DOWN で目標レーンが %d になる" % target_lane,
-            ents.peek("ent_lane", 0) == target_lane,
-            "ent_lane=%d（期待 %d）。ent_lane は移動中も「目標」を指す約束"
-            % (ents.peek("ent_lane", 0), target_lane))
-    r.check("レーン移動が補間される（1フレームで瞬間移動しない）", frames >= 2,
-            "%d フレームで着いた（%s）。瞬間移動だと奥行きの移動が見えず、"
-            "移動中に前後関係が入れ替わる演出も出ない" % (frames, samples))
-    problem = _monotone_problem(samples, target_y)
-    r.check("DOWN のレーン移動が単調で、行き過ぎず lane_ground_y[%d]=%d に吸着する"
-            % (target_lane, target_y), problem is None,
-            "%s。ent_y の推移=%s（%d フレーム）。補間の累算（lane_step_one）か、"
-            "到着時の吸着が壊れている" % (problem, samples, frames))
-    # 作業変数はフレームの更新が終わった点で読む（_slide がそこで止めてある）。
-    # 「更新が終われば片付いている」がエンジンの不変条件であって、
-    # 「更新の途中のどの瞬間も片付いている」ではない（到着処理は step → 足元Y → acc → dy の順に
-    # 書くので、その最中には必ず半端な状態が存在する）。
-    def work():
-        return (ents.peek("ent_lane_step", 0), ents.peek("ent_lane_acc", 0),
-                ents.peek("ent_lane_dy", 0))
-
-    r.check("レーン移動の完了後に補間の作業変数が片付いている", work() == (0, 0, 0),
-            "step=%d acc=%d dy=%d（期待は全て 0）。残っていると次の移動が前回の端数から始まる。"
-            "※ この値はフレームの更新が終わった点（step_frame）で読んでいる。"
-            "更新の最中で読んでいるなら、それはテスト側の観測点の誤りである" % work())
-
-    # 上の1件は「更新が終わった点」という1箇所で見た主張である。それが位相に依存していない
-    # ことまで縛る。静止しているエンティティは lane_update_all に拾われないので、
-    # 作業変数はフレームの**どの命令の切れ目**でも 0 のままでなければならない。
-    # ここが破れたら、静止中のエンティティの作業変数を誰かが毎フレーム書いている。
-    dirty = None
-    count = 0
-    for _ in frame_instructions(nes, labels):
-        count += 1
-        if work() != (0, 0, 0):
-            dirty = (count, work())
-            break
-    r.check("静止したエンティティの補間作業変数は、フレーム更新中のどの命令の切れ目でも 0 "
-            "（%d 箇所を全数検査）" % count, dirty is None,
-            "移動を終えた #0 の作業変数が %s (step, acc, dy)=%s になっている。"
-            "更新に入る前から汚れているなら到着処理の片付け漏れ、更新中に汚れたなら "
-            "ent_lane_step が 0 のエンティティを lane_update_all が飛ばしていない。"
-            "どちらにせよ、作業変数を見る検証はすべて観測点しだいで結論が変わる状態である"
-            % ("フレームの更新に入る前から" if dirty and dirty[0] == 1
-               else "更新の %s 命令目の切れ目で" % (dirty[0] if dirty else -1),
-               dirty[1] if dirty else None))
-
-    # --- 補間中の再入力が無視されること ---
-    samples2 = [ents.peek("ent_y", 0)]
-    tap(nes, labels, "UP")                           # レーン移動を始める
-    lane_mid = ents.peek("ent_lane", 0)
-    tap(nes, labels, "DOWN")                         # 補間の途中で逆方向を入れる
-    interrupted_lane = ents.peek("ent_lane", 0)
-    interrupted_step = ents.peek("ent_lane_step", 0)
-    while ents.peek("ent_lane_step", 0) != 0:
-        step_frame(nes, labels)
-        samples2.append(ents.peek("ent_y", 0))
-    samples2.append(ents.peek("ent_y", 0))
-    r.check("補間中の再入力が無視される", interrupted_lane == lane_mid,
-            "補間中（残り %d フレーム）に DOWN を入れたら目標レーンが %d → %d に変わった。"
-            "移動中の入力は捨てること。受け付けると移動距離が中途半端なまま次の補間が始まり、"
-            "足元Yがレーンの表からずれる" % (interrupted_step, lane_mid, interrupted_lane))
-    r.check("再入力されても足元Yはレーン表の値に着地する",
-            0 <= lane_mid < LANE_COUNT and ents.peek("ent_y", 0) == lane_y[lane_mid],
-            "ent_y=%d / ent_lane=%d（期待 lane_ground_y[%d]=%s）。推移=%s"
-            % (ents.peek("ent_y", 0), lane_mid, lane_mid,
-               lane_y[lane_mid] if 0 <= lane_mid < LANE_COUNT else "レーン番号が範囲外", samples2))
-
-    # --- UP を押し続けてレーン0に張り付くこと ---
-    problems = []
-    for _ in range(LANE_COUNT + 1):
-        before = ents.peek("ent_lane", 0)
-        samples, frames = _slide(nes, labels, ents, "UP")
-        now = ents.peek("ent_lane", 0)
-        expect = max(0, before - 1)
-        if now != expect:
-            problems.append("レーン%d で UP → レーン%d（期待 %d）" % (before, now, expect))
-        if not 0 <= now < LANE_COUNT:
-            problems.append("レーン番号が %d になった（有効なのは 0..%d）。"
-                            "範囲外のレーン番号は lane_ground_y の表の外を引くので足元Yが化ける"
-                            % (now, LANE_COUNT - 1))
-            break
-        p = _monotone_problem(samples, lane_y[now])
-        if p:
-            problems.append("レーン%d→%d の補間: %s（推移=%s）" % (before, now, p, samples))
-        if ents.peek("ent_y", 0) != lane_y[now]:
-            problems.append("レーン%d の足元Yが %d（表は %d）"
-                            % (now, ents.peek("ent_y", 0), lane_y[now]))
-    r.check("UP を%d回でレーン0(y=%d)に着き、それ以上は奥へ抜けない"
-            % (LANE_COUNT + 1, lane_y[0]),
-            not problems and ents.peek("ent_lane", 0) == 0
-            and ents.peek("ent_y", 0) == lane_y[0],
-            "%s。最終 lane=%d y=%d（期待 lane=0 y=%d）。レーン0より奥へ出ると "
-            "lane_ground_y の範囲外を引いて足元Yが化ける"
-            % ("／".join(problems) or "問題なし", ents.peek("ent_lane", 0),
-               ents.peek("ent_y", 0), lane_y[0]))
-
-    # --- DOWN を押し続けて最手前レーンに張り付くこと ---
-    problems = []
-    for _ in range(LANE_COUNT + 1):
-        before = ents.peek("ent_lane", 0)
-        samples, frames = _slide(nes, labels, ents, "DOWN")
-        now = ents.peek("ent_lane", 0)
-        expect = min(LANE_COUNT - 1, before + 1)
-        if now != expect:
-            problems.append("レーン%d で DOWN → レーン%d（期待 %d）" % (before, now, expect))
-        if not 0 <= now < LANE_COUNT:
-            problems.append("レーン番号が %d になった（有効なのは 0..%d）。"
-                            "範囲外のレーン番号は lane_ground_y の表の外を引くので足元Yが化ける"
-                            % (now, LANE_COUNT - 1))
-            break
-        p = _monotone_problem(samples, lane_y[now])
-        if p:
-            problems.append("レーン%d→%d の補間: %s（推移=%s）" % (before, now, p, samples))
-    r.check("DOWN を%d回でレーン%d(y=%d)に着き、それ以上は手前へ抜けない"
-            % (LANE_COUNT + 1, LANE_COUNT - 1, lane_y[-1]),
-            not problems and ents.peek("ent_lane", 0) == LANE_COUNT - 1
-            and ents.peek("ent_y", 0) == lane_y[-1],
-            "%s。最終 lane=%d y=%d（期待 lane=%d y=%d）"
-            % ("／".join(problems) or "問題なし", ents.peek("ent_lane", 0),
-               ents.peek("ent_y", 0), LANE_COUNT - 1, lane_y[-1]))
-
-    restore_enemies()        # 以降の節は敵の居る状態に戻して見る
+    # ent_tile0 は ent_attr より後ろに置く約束である（entity.s）。上の「MAX_ENTITIES ごと」の
+    # 検査は ent_active..ent_attr の区間しか見ないので、この1本で約束を明示的に縛る。
+    if "ent_tile0" in labels:
+        r.check("ent_tile0 がエンティティ表の並びの後ろにある",
+                labels["ent_tile0"] >= labels["ent_attr"] + ents.count,
+                "ent_tile0=$%04X、ent_attr=$%04X（+%d）。ent_active..ent_attr の連なりの"
+                "**内側**に割り込むと、上の「MAX_ENTITIES ごとに並ぶ」が崩れる"
+                % (labels["ent_tile0"], labels["ent_attr"], ents.count))
 
 
 # ---------------------------------------------------------------- NMI の分担
-def _check_nmi_budget(nes, labels, r):
+def _check_nmi_budget(nes, labels, ents, r):
     """NMI が「完成済みバッファを DMA するだけ」に留まっていることの検証。
 
     ここで測るサイクル数は命令単位の近似である（ハーネスは cycle 精度を持たない）。
@@ -455,30 +262,43 @@ def _check_nmi_budget(nes, labels, r):
 
 
 # ---------------------------------------------------------------- 並べ替え
-def _check_sort_order(nes, labels, ents, lane_y, r):
+def _check_sort_order(nes, labels, ents, r):
     """oam_order が「優先度クラス昇順 → 足元Y降順 → 添字昇順（安定）」であること。
 
     足元Yは実装上 8ライン刻みに量子化されるが、それは実装の都合なので期待値には持ち込まない。
-    レーンの足元Y（互いに 8 以上離れている）だけを使って、量子化に依存せずに順序を見る。
+    歩ける帯を4等分した足元Y（互いに 8 以上離れている）だけを使い、量子化に依存せずに順序を見る。
+    レーンは廃止された（ADR-0009）ので、奥行きは連続の足元Yそのものである。
     """
     r.section("OAM 並べ替え（ADR-0002）")
 
+    depths = _depth_samples(nes, labels, 4)
+    q = [d >> SORT_KEY_DEPTH_SHIFT for d in depths]
+    if not r.check("並べ替えに使う4つの足元Y %s が %dライン刻みでも区別できる" % (depths, 1 << SORT_KEY_DEPTH_SHIFT),
+                   len(set(q)) == len(q),
+                   "歩ける帯 %d..%d を4等分した足元Y %s は、%dライン刻みに落とすと %s と"
+                   "重複する。並べ替えキーが同値になり、この節は「奥行き順」ではなく"
+                   "「添字順」を見ていることになる。帯を広げるか、検証の取り方を変えること"
+                   % (nes.ram[labels["depth_y_min"] & 0x7FF],
+                      nes.ram[labels["depth_y_max"] & 0x7FF], depths,
+                      1 << SORT_KEY_DEPTH_SHIFT, q)):
+        return
+
     # (添字, クラス, 足元Y)。同じキーの組を2つ入れて安定性を見る。空きスロットも混ぜる。
-    # #1 と #4 はレーンの外（画面の上端寄り / 下端寄り）に置いてある。
+    # #1 と #4 は歩ける帯の外（画面の上端寄り / 下端寄り）に置いてある。
     # クラスは奥行きより強い（ADR-0002 はクラス0 を「毎フレーム必ず描く」と定めている）ので、
     # 「最も奥のクラス0」が「最も手前のクラス1」より先に出ることを見る。
     scene = [
         (1,  SPR_CLASS_PLAYER,   32),          # 画面のいちばん奥に居るクラス0
-        (4,  SPR_CLASS_PROJECT,  208),         # 画面のいちばん手前に居るクラス1
-        (0,  SPR_CLASS_PLAYER,   lane_y[1]),
-        (2,  SPR_CLASS_FAR_ENE,  lane_y[3]),
-        (3,  SPR_CLASS_FAR_ENE,  lane_y[0]),
-        (5,  SPR_CLASS_NEAR_ENE, lane_y[2]),
-        (6,  SPR_CLASS_FAR_ENE,  lane_y[3]),   # #2 と同じキー（安定なら #2 が先）
-        (7,  SPR_CLASS_EFFECT,   lane_y[3]),
-        (9,  SPR_CLASS_PROJECT,  lane_y[0]),
-        (11, SPR_CLASS_FAR_ENE,  lane_y[1]),
-        (13, SPR_CLASS_NEAR_ENE, lane_y[2]),   # #5 と同じキー（安定なら #5 が先）
+        (4,  SPR_CLASS_PROJECT,  232),         # 画面のいちばん手前に居るクラス1
+        (0,  SPR_CLASS_PLAYER,   depths[1]),
+        (2,  SPR_CLASS_FAR_ENE,  depths[3]),
+        (3,  SPR_CLASS_FAR_ENE,  depths[0]),
+        (5,  SPR_CLASS_NEAR_ENE, depths[2]),
+        (6,  SPR_CLASS_FAR_ENE,  depths[3]),   # #2 と同じキー（安定なら #2 が先）
+        (7,  SPR_CLASS_EFFECT,   depths[3]),
+        (9,  SPR_CLASS_PROJECT,  depths[0]),
+        (11, SPR_CLASS_FAR_ENE,  depths[1]),
+        (13, SPR_CLASS_NEAR_ENE, depths[2]),   # #5 と同じキー（安定なら #5 が先）
     ]
     scene = [e for e in scene if e[0] < ents.count]
     ents.clear()
@@ -601,8 +421,16 @@ def _check_oam_emit(nes, labels, ents, r):
             "OAM の Y=%s（期待 %d = 足元196 - %d）。OAM の Y は実際の表示より1ライン上にずれる "
             "仕様なので、体の高さ+1 を引く" % ([c[0] for c in cols], 196 - ENT_Y_TO_OAM,
                                               ENT_Y_TO_OAM))
-    r.check("属性バイトがエンティティの ent_attr のまま出る", all(c[2] == 1 for c in cols),
-            "属性=%s（期待は全て 1）。パレット指定が落ちると色が化ける" % [c[2] for c in cols])
+    # 期待値 1 は「ent_attr のパレット指定がそのまま出る」ことだけを見ている。
+    # OAM の属性 bit6（水平反転）は **act_face から作り直される**（sprite.s）ので、
+    # 右向き (act_face=0) であることを ents.place が明示的に置いている。
+    # ここを暗黙の前提にしていると、この節より前に LEFT を押す検証を足した日に
+    # **engine が正しいまま落ちる**（engine-dev の申し送り7）。
+    r.check("属性バイトがエンティティの ent_attr のまま出る（右向き = act_face 0 のとき）",
+            all(c[2] == 1 for c in cols),
+            "属性=%s（期待は全て 1）。パレット指定が落ちると色が化ける。"
+            "$41 なら水平反転ビットが立っている＝act_face が 0 でない"
+            % ["$%02X" % c[2] for c in cols])
 
     # --- カメラを動かしたときの画面X ---
     set_camera(nes, labels, 0x0100)
@@ -746,7 +574,7 @@ def _call_rect(nes, labels, a, b):
     return nes.call(labels["rect_overlap"])
 
 
-def _check_rect_overlap(nes, labels, r):
+def _check_rect_overlap(nes, labels, ents, r):
     r.section("rect_overlap（当たり判定プリミティブ）")
 
     wrong = []
@@ -774,21 +602,489 @@ def _check_rect_overlap(nes, labels, r):
             "呼び出しの前後でスタックポインタが %d ずれた" % res.sp_delta)
 
 
-# ---------------------------------------------------------------- レーン距離
-def _check_lane_distance(nes, labels, r):
-    r.section("lane_distance（レーン間の距離）")
+# ---------------------------------------------------------------- 歩ける帯
+# レーン（4段階の量子化）の代わりに入った座標系である（ADR-0009）。
+# 見るのは2つ: 「帯の外に出ないこと」と「帯が定数ではなく変数であること」。
+# 帯はステージの性質（ステージごとに変わる）なので、コードに埋まっていたら
+# stage-author が P3 で足場ごとに帯を変えられない。
+def _band(nes, labels):
+    return (nes.ram[labels["depth_y_min"] & 0x7FF], nes.ram[labels["depth_y_max"] & 0x7FF])
+
+
+def _depth_samples(nes, labels, n):
+    """歩ける帯を n 等分した足元Yを返す（テストに Y の数値を焼き付けないため）。"""
+    lo, hi = _band(nes, labels)
+    if n == 1:
+        return [lo]
+    return [lo + (hi - lo) * i // (n - 1) for i in range(n)]
+
+
+def _depth_frames(band, speed, margin=24):
+    """帯の端から端まで歩くのに要るフレーム数（速さのノブから導く）。"""
+    return (band[1] - band[0]) * 16 // max(1, speed) + margin
+
+
+def _check_depth_band(nes, labels, ents, r):
+    r.section("歩ける帯（奥行きの上下限。ADR-0009）")
+
+    lo, hi = _band(nes, labels)
+    r.check("起動時の歩ける帯が constants.inc の既定値 (%d..%d) になっている"
+            % (D["DEPTH_Y_MIN_DEFAULT"], D["DEPTH_Y_MAX_DEFAULT"]),
+            (lo, hi) == (D["DEPTH_Y_MIN_DEFAULT"], D["DEPTH_Y_MAX_DEFAULT"]),
+            "depth_y_min=%d / depth_y_max=%d（constants.inc の既定は %d..%d）。"
+            "depth_init が呼ばれていないか、帯を誰かが書き換えたまま起動が終わっている"
+            % (lo, hi, D["DEPTH_Y_MIN_DEFAULT"], D["DEPTH_Y_MAX_DEFAULT"]))
+
+    r.check("帯が上下逆でなく、OAM に変換できる範囲に収まっている (%d..%d)" % (lo, hi),
+            ENT_Y_TO_OAM <= lo < hi < 0xEF,
+            "depth_y_min=%d / depth_y_max=%d。%d 未満の足元Yは OAM の Y 計算で借りが出て"
+            "描かれず、$EF 以上は画面外。上下が逆だとクランプが帯の外へ押し出す"
+            % (lo, hi, ENT_Y_TO_OAM))
+
+    # --- depth_clamp: 帯の外の足元Yを帯へ畳む。境界そのものは動かさない ---
+    cases = [(lo - 1, lo, "帯より1ドット奥"), (lo, lo, "帯の奥端ちょうど"),
+             (lo + 1, lo + 1, "帯の中"), (hi - 1, hi - 1, "帯の中（手前寄り）"),
+             (hi, hi, "帯の手前端ちょうど"), (hi + 1, hi, "帯より1ドット手前"),
+             (0, lo, "画面の最上端"), (0xFF, hi, "画面の最下端")]
+    wrong = []
+    for value, want, why in cases:
+        res = nes.call(labels["depth_clamp"], a=value & 0xFF, x=0x5A, y=0xA5)
+        if res.a != want:
+            wrong.append("%s (A=%d) → %d（期待 %d）" % (why, value & 0xFF, res.a, want))
+        if (res.x, res.y) != (0x5A, 0xA5):
+            wrong.append("%s で X/Y が壊れた (X=$%02X Y=$%02X、期待 $5A/$A5)"
+                         % (why, res.x, res.y))
+    r.check("depth_clamp が足元Yを歩ける帯 (%d..%d) に畳む（%d ケース・X と Y を壊さない）"
+            % (lo, hi, len(cases)), not wrong,
+            "%s。帯の外の足元Yは、置いた側が帯を知らなくても畳まれるのが約束である"
+            % "／".join(wrong))
+
+    # --- 帯は変数である: depth_set_band で差し替えられること（ステージごとに変わる） ---
+    new_lo, new_hi = lo + 10, hi - 20
+    res = nes.call(labels["depth_set_band"], a=new_lo, y=new_hi, x=0x33)
+    got = _band(nes, labels)
+    moved = nes.call(labels["depth_clamp"], a=lo).a
+    nes.call(labels["depth_set_band"], a=lo, y=hi)          # 元に戻す
+    r.check("depth_set_band で歩ける帯を差し替えられる（帯は定数ではなく変数）",
+            got == (new_lo, new_hi) and moved == new_lo and _band(nes, labels) == (lo, hi),
+            "帯を %d..%d に差し替えたら depth_y_min/max=%s になり、古い奥端 %d を"
+            "clamp した結果が %d（期待 %d）。帯がコードに埋まっていると、"
+            "P3 で stage-author がステージごとの床の広さを持てない（ADR-0009 残る論点2）"
+            % (new_lo, new_hi, got, lo, moved, new_lo))
+    r.check("depth_set_band が X を壊さない", res.x == 0x33,
+            "X が $33 → $%02X に変わった。帯を張り直す側がエンティティ番号を"
+            "持ったまま呼べることが約束である（depth.s の注記）" % res.x)
+
+    # --- 実際に操作キャラを端まで歩かせる。端で張り付いても壊れないこと ---
+    # 見たいのは奥行きのクランプであって戦闘下の挙動ではないので、敵を眠らせる
+    # （殴られると のけぞりで入力が通らず、engine が正しいまま落ちる）。
+    restore = disarm_enemies(nes, labels)
+    # 端の手前に置いてから押す。帯の端から端まで歩かせても見えるものは同じで、
+    # 回すフレーム数だけが増える（CI が遅いと誰も回さなくなる）。
+    run_up = 10
+    frames = _depth_frames((0, run_up), D["ACT_DEPTH_SPEED"], margin=8)
+    for button, edge, sign, where in (("UP", lo, +1, "奥"), ("DOWN", hi, -1, "手前")):
+        ents.poke("ent_y", 0, edge + sign * run_up)
+        nes.set_buttons({button})
+        nes.run_frames(frames)
+        frame_end(nes, labels)
+        at_edge = ents.peek("ent_y", 0)
+        nes.run_frames(20)                  # 端に着いてからも押し続ける
+        frame_end(nes, labels)
+        stuck = ents.peek("ent_y", 0)
+        nes.set_buttons(set())
+        r.check("%s を押し続けると足元Yが帯の%s端 %d で止まり、押し続けても抜けない"
+                % (button, where, edge),
+                at_edge == edge and stuck == edge,
+                "端の %d ドット手前から %d フレーム押して足元Y=%d、さらに20フレーム押して %d"
+                "（期待はどちらも %d）。帯を抜けると足元Yが 0/255 を回り込み、"
+                "OAM の Y 計算で借りが出てキャラが画面から消える。"
+                "奥行きの速さは %d/16 ドット/f（action_params.inc の ACT_DEPTH_SPEED）"
+                % (run_up, frames, at_edge, stuck, edge, D["ACT_DEPTH_SPEED"]))
+    restore()
+
+
+# ---------------------------------------------------------------- ent_depth_move
+def _check_ent_depth_move(nes, labels, ents, r):
+    """X = エンティティ, A = 符号つき移動量。桁あふれ・借り・クランプ。"""
+    r.section("ent_depth_move（足元Yを符号つきの量だけ動かす）")
+
+    lo, hi = _band(nes, labels)
+    slot = ents.count - 1                       # 操作キャラや仲間に触らない空きスロット
+    mid = (lo + hi) // 2
+
+    # (足元Yの初期値, 移動量, 期待, 何を見ているか)
+    cases = [
+        (mid, 0, mid, "移動量 0 では動かない"),
+        (mid, 5, mid + 5, "手前へ 5"),
+        (mid, -5, mid - 5, "奥へ 5"),
+        (hi - 1, 1, hi, "手前端ちょうどに着く"),
+        (hi - 1, 2, hi, "手前端を越えようとしてクランプされる"),
+        (lo + 1, -1, lo, "奥端ちょうどに着く"),
+        (lo + 1, -2, lo, "奥端を越えようとしてクランプされる"),
+        (hi, 1, hi, "手前端で押し続けても動かない"),
+        (lo, -1, lo, "奥端で押し続けても動かない"),
+        (250, 10, hi, "足元Yの加算が 255 を越える（桁あふれ）"),
+        (250, 0, hi, "帯より手前に居た状態で手前へ押しても帯を越えない"),
+        (5, -10, lo, "足元Yの減算が 0 を下回る（借り）"),
+        (mid, 127, hi, "移動量の最大（+127）"),
+        (mid, -128, lo, "移動量の最小（-128）"),
+    ]
+    wrong = []
+    for start, delta, want, why in cases:
+        ents.poke("ent_y", slot, start)
+        res = nes.call(labels["ent_depth_move"], x=slot, a=delta & 0xFF)
+        got = ents.peek("ent_y", slot)
+        if got != want:
+            wrong.append("%s: 足元Y %d に %+d → %d（期待 %d）" % (why, start, delta, got, want))
+        if res.x != slot:
+            wrong.append("%s: X が %d → %d に壊れた（エンティティ番号を持ったまま呼べない）"
+                         % (why, slot, res.x))
+        if res.a != got:
+            wrong.append("%s: 戻り値 A=%d が書いた足元Y %d と違う" % (why, res.a, got))
+    r.check("ent_depth_move が帯 (%d..%d) の中で符号つきに動き、桁あふれ・借りでも"
+            "帯を抜けない（%d ケース）" % (lo, hi, len(cases)), not wrong,
+            "%s。押したフレームに押したぶんだけ動く（補間しない）のが ADR-0009 の要点であり、"
+            "クランプは engine の持ち分である（action / ai は帯の値を知らない）"
+            % "／".join(wrong))
+
+    ents.poke("ent_active", slot, ENT_INACTIVE)
+
+
+# ---------------------------------------------------------------- depth_distance
+def _check_depth_distance(nes, labels, ents, r):
+    """A, Y → A = |足元Yの差|, Z = 一致。**lane_distance の 4×4 の代わり**（ADR-0009）。"""
+    r.section("depth_distance（足元Yの近さ。当たり判定の土台）")
+
+    lo, hi = _band(nes, labels)
+    values = sorted({0, 1, 2, 5, 6, 7, 127, 128, 129, lo, lo + 1, hi - 1, hi, 200, 254, 255})
+    wrong, zwrong, xwrong = [], [], []
+    for a in values:
+        for b in values:
+            res = nes.call(labels["depth_distance"], a=a, y=b, x=0x7E)
+            if res.a != abs(a - b):
+                wrong.append("(%d, %d) → %d（期待 %d）" % (a, b, res.a, abs(a - b)))
+            if res.zero != (a == b):
+                zwrong.append("(%d, %d) → Z=%d（期待 %d）" % (a, b, res.zero, a == b))
+            if res.x != 0x7E:
+                xwrong.append("(%d, %d) で X が $%02X に壊れた" % (a, b, res.x))
+    r.check("depth_distance が %d×%d 全ての組で |足元Yの差| を返す" % (len(values), len(values)),
+            not wrong,
+            "%s。奥行きの距離が狂うと、Y許容幅での当たり判定（action-dev が使う）と"
+            "AI の標的選択が同時に総崩れになる" % "、".join(wrong[:6]))
+    r.check("depth_distance の Z フラグが「足元Yが一致」を表す", not zwrong,
+            "%s。Z だけを見て一致判定をする呼び出し側が誤爆する" % "、".join(zwrong[:6]))
+    r.check("depth_distance が X を壊さない（エンティティ番号を持ったまま呼べる）", not xwrong,
+            "%s。combat.s / ai.s は X にエンティティ番号を置いたまま呼んでいる"
+            % "、".join(xwrong[:3]))
+
+
+# ---------------------------------------------------------------- 向き・影・効果
+def _body_widths(nes, labels):
+    n = table_length(labels, "body_width")
+    if not 1 <= n <= 16:
+        n = D["BODY_TYPE_COUNT"]
+    return [nes.read(labels["body_width"] + b) for b in range(n)]
+
+
+def _clear_fx(nes, labels):
+    """前の節が残した効果スプライトを消す。OAM の余りに出るので数え違いの元になる。"""
+    if "fx_clear_all" in labels:
+        nes.call(labels["fx_clear_all"])
+
+
+def _emit_one(nes, labels, ents, **kw):
+    """エンティティ #0 を1体だけ置いて OAM を組み、(使用数, エントリの列) を返す。"""
+    ents.clear()
+    _clear_fx(nes, labels)
+    set_camera(nes, labels, 0)
+    ents.place(0, **kw)
+    used, dropped = build_oam(nes, labels)
+    return used, [shadow_entry(nes, labels, i) for i in range(used)], dropped
+
+
+def _check_facing(nes, labels, ents, r):
+    """向き（水平反転）の出どころが act_face ただ1つであること（sprite.s 冒頭の約束）。
+
+    P1 の受入で主が指摘した「向きが画面に出ていない」への対応であり、
+    ここが崩れると**左を向いて右へ歩く**絵になる。
+    """
+    r.section("向き（水平反転の出どころは act_face ただ1つ）")
+
+    widths = _body_widths(nes, labels)
+    y = _depth_samples(nes, labels, 2)[1]
+
+    # --- 1. act_face が OAM 属性の bit6 を決める。ent_attr の bit6 は勝てない ---
+    pal = 1
+    cases = [(0, 0, pal, "右向き"),
+             (1, 0, pal | ENT_ATTR_HFLIP, "左向き"),
+             (0, ENT_ATTR_HFLIP, pal, "右向きなのに ent_attr に反転ビットが立っている"),
+             (1, ENT_ATTR_HFLIP, pal | ENT_ATTR_HFLIP, "左向きで ent_attr にも反転ビット")]
+    wrong = []
+    for face, extra, want, why in cases:
+        _, cols, _ = _emit_one(nes, labels, ents, x=64, y=y, cls=SPR_CLASS_PLAYER,
+                               body=0, tile=4, attr=pal | extra, face=face)
+        got = [c[2] for c in cols]
+        if got != [want] * len(cols):
+            wrong.append("%s (act_face=%d, ent_attr=$%02X): OAM 属性=%s（期待 $%02X）"
+                         % (why, face, pal | extra, ["$%02X" % g for g in got], want))
+    r.check("OAM の属性は act_face で作り直され、ent_attr の反転ビットは勝てない", not wrong,
+            "%s。向きの出どころが2箇所あると、どちらが勝つかは書き順しだいになる。"
+            "emit は ENT_ATTR_OAM_MASK($%02X) で落としてから act_face で作り直すこと"
+            % ("／".join(wrong), ENT_ATTR_OAM_MASK))
+
+    # --- 2. 体が2タイル幅以上のとき、左向きは列の並びが逆順になる ---
+    # 水平反転は1枚ごとの絵を裏返すだけで、**列の並び順は裏返してくれない**。
+    # ここが抜けると、体の左半分に右半分の絵が出る（顔と背中が入れ替わる）。
+    tile0 = 4
+    problems = []
+    seen_widths = []
+    for body, w in enumerate(widths):
+        if w < 2:
+            continue
+        seen_widths.append(w)
+        _, right, _ = _emit_one(nes, labels, ents, x=64, y=y, cls=SPR_CLASS_PLAYER,
+                                body=body, tile=tile0, attr=0, face=0)
+        _, left, _ = _emit_one(nes, labels, ents, x=64, y=y, cls=SPR_CLASS_PLAYER,
+                               body=body, tile=tile0, attr=0, face=1)
+        want_tiles = [tile0 + SPR_POSE_STRIDE * i for i in range(w)]
+        if [c[1] for c in right] != want_tiles:
+            problems.append("体格%d(幅%d) 右向きのタイル=%s（期待 %s）"
+                            % (body, w, [c[1] for c in right], want_tiles))
+        if [c[1] for c in left] != want_tiles[::-1]:
+            problems.append("体格%d(幅%d) 左向きのタイル=%s（期待 %s = 右向きの逆順）"
+                            % (body, w, [c[1] for c in left], want_tiles[::-1]))
+        if [c[3] for c in left] != [c[3] for c in right]:
+            problems.append("体格%d(幅%d) 左向きの X=%s（右向きは %s）。X の並びは向きで変わらない"
+                            % (body, w, [c[3] for c in left], [c[3] for c in right]))
+    r.check("体格の幅 %s で、左向きのタイル列が右向きの逆順になり X の並びは変わらない"
+            % sorted(set(seen_widths)), not problems,
+            "%s。反転ビットは1枚ごとの絵を裏返すだけで列の並びは裏返さないので、"
+            "左向きでは末尾のタイルから -%d ずつ並べる必要がある（sprite.s の spr_tstep）"
+            % ("／".join(problems), SPR_POSE_STRIDE))
+
+
+def _check_shadow(nes, labels, ents, r):
+    """影（足元に1枚）。**奥行きを画面に出す唯一の手がかり**（P1 受入の指摘5）。"""
+    r.section("影（足元に敷く1枚。ADR-0002 の「余りで出す」側）")
+
+    widths = _body_widths(nes, labels)
+    widest = max(widths)
+    widest_body = widths.index(widest)
+    y = _depth_samples(nes, labels, 2)[1]
+
+    # --- 有効化すると既定で影が付く（置いた側が忘れても成立する。entity.s）---
+    ents.clear()
+    _clear_fx(nes, labels)
+    set_camera(nes, labels, 0)
+    ents.place(0, x=64, y=y, cls=SPR_CLASS_PLAYER, body=widest_body, tile=4, attr=0)
+    nes.call(labels["ent_activate"], x=0)
+    r.check("ent_activate が影を敷く印 (ENT_ATTR_SHADOW=$%02X) を既定で立てる" % ENT_ATTR_SHADOW,
+            bool(ents.peek("ent_attr", 0) & ENT_ATTR_SHADOW),
+            "ent_attr=$%02X。影は奥行きを画面に出す唯一の手がかりなので、既定は「敷く」である。"
+            "接地していないもの（効果・飛び道具）だけが有効化のあとで下ろす"
+            % ents.peek("ent_attr", 0))
+
+    used, _ = build_oam(nes, labels)
+    cols = [shadow_entry(nes, labels, i) for i in range(used)]
+    body_rows = [c for c in cols if c[1] != SPR_TILE_SHADOW]
+    shadows = [(i, c) for i, c in enumerate(cols) if c[1] == SPR_TILE_SHADOW]
+
+    r.check("影が本体のぶんに1枚だけ足される（本体 %d 列 + 影 1 枚）" % widest,
+            used == widest + 1 and len(shadows) == 1,
+            "使用 %d エントリ、うち影のタイル($%02X)が %d 枚（期待は本体 %d + 影 1）。"
+            "影は体格の幅によらず1枚である（8ドット幅のタイル1つを足元の中央に敷く）"
+            % (used, SPR_TILE_SHADOW, len(shadows), widest))
+
+    # 影が1枚も出ていないときも、下の3件は**素通りさせずに落とす**。
+    # `if shadows:` で囲むと、影が消えた日にこの3件が黙って居なくなる
+    # （ラベルの門番で起きたのと同じ「静かに消える」不具合である）。
+    idx, sh = shadows[0] if shadows else (-1, ("影なし", "-", "-", "影なし"))
+    body_last = max([i for i, c in enumerate(cols) if c[1] != SPR_TILE_SHADOW], default=-1)
+    if True:
+        r.check("影が本体より必ず後ろの OAM エントリに置かれる（影がキャラを隠さない）",
+                bool(shadows) and idx > body_last,
+                "影が #%d（-1 = 1枚も出ていない）、本体が #%s。OAM は先頭ほど前面に描かれ、"
+                "1スキャンライン8スプライト制約でも生き残る。影が本体より前に出ると、"
+                "混んだ場面で**本体が消えて影だけ残る**"
+                % (idx, [i for i, c in enumerate(cols) if c[1] != SPR_TILE_SHADOW]))
+        r.check("影の OAM の Y が本体と同じ（接地線にそろう）",
+                bool(shadows) and sh[0] == body_rows[0][0] == y - ENT_Y_TO_OAM,
+                "影の Y=%s / 本体の Y=%d（足元Y %d - %d = %d）。"
+                "CHR の影はタイルの下端に描いてあるので、本体と同じ Y に置けば足元に来る"
+                % (sh[0], body_rows[0][0], y, ENT_Y_TO_OAM, y - ENT_Y_TO_OAM))
+        want_x = 64 + (widest - 1) * SPRITE_W // 2
+        r.check("影が体の横幅の中央に寄る（体格の幅 %d → X=%d）" % (widest, want_x),
+                bool(shadows) and sh[3] == want_x,
+                "影の X=%s（期待 %d = 本体X 64 + (幅%d - 1) * %d / 2）。"
+                "体格ごとの表を増やさずに body_width から計算する約束である"
+                % (sh[3], want_x, widest, SPRITE_W))
+
+    # --- 影がキャラを押し出さないこと ---
+    # 本体だけで OAM を使い切る場面を作る。影は1枚も出ないが、**本体は1列も欠けない**。
+    ents.clear()
+    _clear_fx(nes, labels)
+    for i in range(ents.count):
+        ents.place(i, x=8 * i, y=y, cls=SPR_CLASS_FAR_ENE, body=widest_body, tile=0,
+                   attr=ENT_ATTR_SHADOW)
+    used, dropped = build_oam(nes, labels)
+    fx_dropped = nes.ram[labels["oam_fx_dropped"] & 0x7FF]
+    r.check("本体で OAM を使い切る場面でも、影はキャラを1列も押し出さない"
+            "（本体 %d 体 × 幅 %d = %d）" % (ents.count, widest, ents.count * widest),
+            dropped == 0 and used == min(ents.count * widest, OAM_SPRITE_MAX)
+            and fx_dropped == ents.count,
+            "oam_dropped=%d（本体の捨て。期待 0）/ oam_used=%d / oam_fx_dropped=%d"
+            "（出せなかった影。期待 %d）。影は「余りで出す」ものなので、"
+            "足りなければ**影が消える**のが正しい。ここで oam_dropped が増えるなら、"
+            "影が本体より先に OAM を取っている（emit の順序が壊れた）"
+            % (dropped, used, fx_dropped, ents.count))
+    r.check("出せなかった影の数が本体の捨てと混ざっていない (oam_fx_dropped)",
+            fx_dropped > 0 and dropped == 0,
+            "oam_fx_dropped=%d / oam_dropped=%d。影と効果が出せないのは仕様どおりの動作で、"
+            "本体が捨てられるのは不具合である。この2つを同じカウンタで数えると、"
+            "P2 の重み付き巡回（ADR-0002）を調整するときに区別が付かない" % (fx_dropped, dropped))
+
+    ents.clear()
+
+
+def _check_fx(nes, labels, ents, r):
+    """短命の効果スプライト（斬り・衝撃）の枠と寿命。**後始末は engine が持つ。**"""
+    r.section("効果スプライト fx（枠・寿命・消し忘れの防止）")
+
+    fx_max = labels["fx_x_lo"] - labels["fx_life"]
+    r.check("効果の枠数が constants.inc の FX_MAX (%d) と一致する" % D["FX_MAX"],
+            fx_max == D["FX_MAX"],
+            "ラベルの間隔から読んだ枠数は %d だが FX_MAX は %d。"
+            "fx_* の配列長が揃っていないと `lda fx_y, x` が隣の列を読む"
+            % (fx_max, D["FX_MAX"]))
+
+    def life(i):
+        return nes.ram[(labels["fx_life"] + i) & 0x7FF]
+
+    def spawn(x=0x0140, y=180, tile=50, attr=3, frames=4, regx=0x11, regy=0x22):
+        for name, value in (("fx_arg_x_lo", x & 0xFF), ("fx_arg_x_hi", (x >> 8) & 0xFF),
+                            ("fx_arg_y", y), ("fx_arg_tile", tile), ("fx_arg_attr", attr),
+                            ("fx_arg_life", frames)):
+            nes.ram[labels[name] & 0x7FF] = value
+        return nes.call(labels["fx_spawn"], x=regx, y=regy)
+
+    nes.call(labels["fx_clear_all"])
+    r.check("fx_clear_all で全ての枠が空く（寿命 0 = 空き）",
+            all(life(i) == 0 for i in range(fx_max)),
+            "fx_life=%s。シーン開始で消し残すと、前のシーンの斬りが画面に残る"
+            % [life(i) for i in range(fx_max)])
+
+    res = spawn(x=0x0140, y=180, tile=50, attr=3, frames=4)
+    slots = [i for i in range(fx_max) if life(i)]
+    r.check("fx_spawn が空き枠に1つ出し、キャリークリアで返る（X と Y を壊さない）",
+            not res.carry and len(slots) == 1 and (res.x, res.y) == (0x11, 0x22),
+            "carry=%d / 生きている枠=%s / X=$%02X Y=$%02X（期待 $11/$22）。"
+            "エンティティ番号を X に持ったまま呼べることが約束である（fx.s 冒頭）"
+            % (res.carry, slots, res.x, res.y))
+    # 枠が1つも生きていなくても、下の1件は素通りさせずに落とす（黙って消えないため）。
+    i = slots[0] if slots else 0
+    if True:
+        got = (nes.ram[(labels["fx_x_lo"] + i) & 0x7FF],
+               nes.ram[(labels["fx_x_hi"] + i) & 0x7FF],
+               nes.ram[(labels["fx_y"] + i) & 0x7FF],
+               nes.ram[(labels["fx_tile"] + i) & 0x7FF],
+               nes.ram[(labels["fx_attr"] + i) & 0x7FF],
+               life(i))
+        r.check("fx_arg_* がそのまま枠へ写る",
+                bool(slots) and got == (0x40, 0x01, 180, 50, 3, 4),
+                "生きている枠=%s / 枠 #%d = (x_lo,x_hi,y,tile,attr,life)=%s"
+                "（期待 (64,1,180,50,3,4)）" % (slots, i, got))
+
+    # --- 寿命どおり出て、誰も後始末しなくても自動で消える ---
+    nes.call(labels["fx_clear_all"])
+    spawn(frames=3)
+    alive = []
+    for _ in range(6):
+        alive.append(sum(1 for i in range(fx_max) if life(i)))
+        nes.call(labels["fx_update"])
+    r.check("寿命 3 の効果が 3 フレーム出て、4 フレーム目に自動で消える",
+            alive == [1, 1, 1, 0, 0, 0],
+            "各フレームの生存数=%s（期待 [1,1,1,0,0,0]）。fx_update は寿命を1つ減らし、"
+            "尽きた枠を空きに戻す。**呼び出し側に後始末をさせない**のが約束であり、"
+            "消し忘れは「画面に判定の残骸が残る」という最も気付きにくい不具合になる" % alive)
+
+    nes.call(labels["fx_clear_all"])
+    spawn(frames=0)
+    r.check("寿命 0 で呼ばれても 1 フレームは出る（入れ忘れが黙って消えない）",
+            sum(1 for i in range(fx_max) if life(i)) == 1,
+            "生きている枠=%d（期待 1）。黙って何も出ないと、呼び出し側からは"
+            "「枠が無かった」のか「寿命を入れ忘れた」のか区別がつかない"
+            % sum(1 for i in range(fx_max) if life(i)))
+
+    # --- 枠が尽きたら C=1 で断る。既に出ているものを壊さない ---
+    nes.call(labels["fx_clear_all"])
+    results = [spawn(frames=9, tile=50 + 2 * (k % 3)) for k in range(fx_max)]
+    before = [life(i) for i in range(fx_max)]
+    over = spawn(frames=9)
+    r.check("FX_MAX(%d) を超える fx_spawn がキャリーセットで断り、出ているものを壊さない" % fx_max,
+            all(not x.carry for x in results) and over.carry
+            and [life(i) for i in range(fx_max)] == before,
+            "最初の %d 回の carry=%s / %d 回目の carry=%d / 枠の寿命 %s → %s。"
+            "枠が空いていなくても呼び出し側は何もしなくてよい（効果は消えてよいもの。"
+            "ADR-0002 の SPR_CLASS_EFFECT）が、**既に出ている効果を上書きしてはならない**"
+            % (fx_max, [x.carry for x in results], fx_max + 1, over.carry,
+               before, [life(i) for i in range(fx_max)]))
+
+    # --- 生きている効果が OAM に出て、死んだら出ない ---
+    nes.call(labels["fx_clear_all"])
+    y = _depth_samples(nes, labels, 2)[1]
+    ents.clear()
+    set_camera(nes, labels, 0)
+    ents.place(0, x=32, y=y, cls=SPR_CLASS_PLAYER, body=0, tile=4, attr=0)
+    base, _ = build_oam(nes, labels)
+    spawn(x=96, y=y, tile=50, attr=3, frames=1)
+    with_fx, _ = build_oam(nes, labels)
+    tiles = [shadow_entry(nes, labels, i)[1] for i in range(with_fx)]
+    nes.call(labels["fx_update"])                    # 寿命が尽きる
+    after, _ = build_oam(nes, labels)
+    r.check("生きている効果が OAM に1枚増え、寿命が尽きると消える",
+            with_fx == base + 1 and 50 in tiles and after == base,
+            "効果なし %d エントリ → 効果あり %d エントリ（タイル=%s）→ 寿命切れ後 %d。"
+            "効果が消えないと、攻撃が終わっても斬りの絵が画面に残り続ける"
+            % (base, with_fx, tiles, after))
+    nes.call(labels["fx_clear_all"])
+    ents.clear()
+
+
+def _check_pose(nes, labels, ents, r):
+    """姿勢の差し替え（ent_set_pose）。**何の絵を出すかを決めるのは action / ai** で、
+    engine が持つのは役割の先頭タイル（ent_tile0）と、このずらし1本だけである。"""
+    r.section("姿勢 (ent_set_pose = ent_tile0 + 姿勢 * %d)" % SPR_POSE_STRIDE)
+
+    slot = ents.count - 1
+    base = 32
+    ents.place(slot, x=0, y=_depth_samples(nes, labels, 2)[1], body=0, tile=base, attr=0)
+    nes.call(labels["ent_activate"], x=slot)
+    r.check("ent_activate が置いたタイルを役割の先頭タイル (ent_tile0) として覚える",
+            ents.peek("ent_tile0", slot) == base,
+            "ent_tile0=%d（期待 %d）。覚えていないと、姿勢を1回切り替えた後に"
+            "元の絵へ戻れない（姿勢のずらしが累積する）"
+            % (ents.peek("ent_tile0", slot), base))
 
     wrong = []
-    zwrong = []
-    for i in range(LANE_COUNT):
-        for j in range(LANE_COUNT):
-            res = nes.call(labels["lane_distance"], a=i, y=j)
-            if res.a != abs(i - j):
-                wrong.append("(%d, %d) → %d（期待 %d）" % (i, j, res.a, abs(i - j)))
-            if res.zero != (i == j):
-                zwrong.append("(%d, %d) → Z=%d（期待 %d）" % (i, j, res.zero, i == j))
-    r.check("lane_distance が %d×%d 全ての組で |差| を返す" % (LANE_COUNT, LANE_COUNT), not wrong,
-            "%s。レーン間の距離が狂うと、隣レーンへの攻撃判定（action-dev が使う）が総崩れになる"
-            % "、".join(wrong))
-    r.check("lane_distance の Z フラグが「同一レーン」を表す", not zwrong,
-            "%s。Z フラグだけを見て同レーン判定をする呼び出し側が誤爆する" % "、".join(zwrong))
+    for pose in range(SPR_POSE_COUNT):
+        nes.call(labels["ent_set_pose"], x=slot, a=pose)
+        want = base + pose * SPR_POSE_STRIDE
+        if ents.peek("ent_tile", slot) != want:
+            wrong.append("姿勢 %d → ent_tile=%d（期待 %d）"
+                         % (pose, ents.peek("ent_tile", slot), want))
+    r.check("ent_set_pose が %d 姿勢すべてで ent_tile0 + 姿勢 * %d を書く"
+            % (SPR_POSE_COUNT, SPR_POSE_STRIDE), not wrong,
+            "%s。8x16 スプライトは1体が上下2タイルを使うので、姿勢の間隔は %d である。"
+            "ここがずれると、攻撃の絵のつもりで別の役割のタイルを出す"
+            % ("／".join(wrong), SPR_POSE_STRIDE))
+
+    # 役割の先頭タイルが変わっても呼び出し側は何も直さなくてよい、という約束。
+    ents.poke("ent_tile0", slot, 16)
+    nes.call(labels["ent_set_pose"], x=slot, a=1)
+    r.check("役割の先頭タイルを変えると、同じ姿勢の指定でも出る絵がその役割のものになる",
+            ents.peek("ent_tile", slot) == 16 + SPR_POSE_STRIDE,
+            "ent_tile0=16 で姿勢1を指定したら ent_tile=%d（期待 %d）。"
+            "姿勢の語彙（SPR_POSE_*）は役割に依存しない、が約束である"
+            % (ents.peek("ent_tile", slot), 16 + SPR_POSE_STRIDE))
+    ents.clear()

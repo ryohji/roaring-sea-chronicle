@@ -26,6 +26,7 @@ from l2_scroll import (layer2_scroll, check_nmi_write_budget,  # noqa: E402
                        DIAG_COUNTERS)
 from l2_camera import layer2_camera            # noqa: E402
 from l2_ai import layer2_ai                    # noqa: E402
+from l2_action import layer2_action            # noqa: E402
 from scene import disarm_enemies               # noqa: E402
 
 
@@ -37,7 +38,7 @@ ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途�
 # **最中**である。実測（P1 後半時点）:
 #     NMI+0     NMI ハンドラ（OAM DMA → VRAM 転送 → スクロール設定）
 #     NMI+997   read_pad
-#     NMI+1466  lane_update_all
+#     NMI+1466  action_update（当時は lane_update_all）
 #     NMI+2247  oam_build が操作キャラの OAM シャドウ X を書く   ← ここ
 #     NMI+2280  run_frames が戻る
 # つまり「入力を離しても動かない」の類を run_frames の直後に生で読むと、
@@ -49,8 +50,8 @@ ADR1 = "ADR-0001（案A: バッテリーバックアップ + シナリオ中途�
 # 位置の比較を行うテストは必ず settle() を通してから読むこと。
 #
 # **ただし settle() で救えるのは「落ち着けば動かなくなる量」だけである。**
-# 作業変数（ent_lane_step / ent_lane_acc / ent_lane_dy、これから増える act_timer /
-# act_hitstop / act_invuln のようなタイマー類）は、静止していても**更新の最中には
+# 作業変数（act_timer / act_hitstop / act_invuln のようなタイマー類、
+# fx_life、組み立て中の oam_next）は、静止していても**更新の最中には
 # 半端な値を通過する**。それらを run_frames の直後に生で読むと、メインループの
 # 命令数が変わった日に別の隙間を覗いて落ちる。作業変数は harness の
 # frame_end() / step_frame() で「そのフレームの更新が終わった点」まで進めてから読むこと。
@@ -537,6 +538,8 @@ def main(argv=None):
         layer2_camera(args.rom, labels, r)
         print()
         layer2_ai(args.rom, labels, r)
+        print()
+        layer2_action(args.rom, labels, r)
         print()
         # ここまでの検証が回した**全ての NMI** をまとめて見る。転送量の上限は
         # 抜き取り（混んでいるフレームを20フレーム）では位相しだいで素通りするので、

@@ -22,20 +22,27 @@ sys.path.insert(0, os.path.join(HERE, "harness"))
 from cpu6502 import CpuCrash                        # noqa: E402
 from nes import Nes, boot, frame_end, step_frame    # noqa: E402
 from scene import disarm_enemies, slot_ranges       # noqa: E402
+from gate import Gate, run_sections, boot_or_fail   # noqa: E402
+from srcdefs import action_defs                     # noqa: E402
 
 TSV_PATH = os.path.join(os.path.dirname(HERE), "data", "ai_params.tsv")
 
 # data/ai_params.tsv の列名と、src/ai/ai_params.s の配列ラベルの対応。
 # id と name は表に出ない（id は添字そのもの、name は roster から引くための識別子）。
+# **レーンは ADR-0009 で廃止した。** lane_hold（次にレーンを移れるまでの待ちフレーム数）は
+# depth_spd（奥行きの寄り足の速さ）に意味ごと変わっている（TSV の列の説明を見よ）。
 PARAM_COLUMNS = ("speed", "hold_x", "reach_x", "aggr_x",
-                 "follow_x", "leash_x", "atk_gap", "lane_hold", "item_pri")
+                 "follow_x", "leash_x", "atk_gap", "depth_spd", "item_pri")
 
-NEEDED = ("ent_active", "ent_x_lo", "ent_x_hi", "ent_lane", "ent_lane_step",
-          "ent_state", "ent_ai", "ent_activate",
-          "ai_init", "ai_init_entity", "ai_sit", "ai_goal", "ai_target", "ai_gap",
-          "ai_default_profile", "act_hp", "act_init_entity", "act_enter_down",
-          "action_revive", "act_damage", "act_atk_ent", "act_kb_dir", "act_kb_amt",
-          "act_hitstop", "wait_nmi") + tuple("ai_p_" + c for c in PARAM_COLUMNS)
+# 足場（シーンを組み立てて走らせる）に要るラベル。ここが欠けたときだけ層ごと諦める。
+CORE = ("ent_active", "ent_x_lo", "ent_x_hi", "ent_y", "ent_state", "ent_ai", "wait_nmi")
+
+D = action_defs()
+# 「奥行きが近い」と見なす足元Yの差。8x16 のスプライトは足元Yが SPRITE_H 未満しか
+# 離れていなければ必ず走査線を共有する＝画面で重なって見える。
+# **当たり判定のY許容幅（action の持ち分）とは別物である。**ここで見たいのは
+# 「絵が重なるか」であって「攻撃が届くか」ではない。
+DEPTH_OVERLAP_Y = D["SPRITE_H"]
 
 # 「重なっている」と見なす横距離。スプライトは 8x16 が横に並ぶので、
 # 原点どうしが 8 ドット未満なら絵が必ず重なる（＝1体が他方の陰に入る）。
@@ -115,7 +122,15 @@ class Scene:
         for i in range(first, end):
             self.put("ent_active", i, 0)
 
-    def place_second_ally(self, x, lane):
+    def y(self, i):
+        """足元Y = 奥行きそのもの（ADR-0009。レーン番号という概念は無い）。"""
+        return self.get("ent_y", i)
+
+    def near_depth(self, i, j):
+        """2体の絵が奥行き方向で重なるか（走査線を共有するか）。"""
+        return abs(self.y(i) - self.y(j)) < DEPTH_OVERLAP_Y
+
+    def place_second_ally(self, x, y):
         """自律仲間をもう1体、配置側（P3 の waves / P4 の roster）と同じ手順で置く。
 
         ent_* を詰める → ent_activate → act_init_entity → ai_init。
@@ -124,7 +139,7 @@ class Scene:
         """
         i = self.slots["ally_first"] + 1
         self.set_x(i, x)
-        for name, value in (("ent_lane", lane), ("ent_class", 3), ("ent_body", 0),
+        for name, value in (("ent_y", y), ("ent_class", 3), ("ent_body", 0),
                             ("ent_ai", 0), ("ent_tile", 0), ("ent_attr", 2),
                             ("ent_state", ACT_ST_IDLE)):
             self.put(name, i, value)
@@ -147,30 +162,41 @@ def _runs_of(flags):
 def layer2_ai(rom_path, labels, r):
     print("L2 実行検証 / ai P1（自律仲間・敵の思考と行動）")
 
-    missing = [n for n in NEEDED if n not in labels]
-    if missing:
-        r.check("ai のラベルが build/roaring.labels に揃っている", False,
-                "ラベルが無い: %s。.export が消えたか、モジュールがリンクから外れている。"
-                "このセクションの検証はラベル無しでは書けないので全部飛ばした" % ", ".join(missing))
+    gate = Gate(labels, r, "ai")
+    if not boot_or_fail(gate, CORE, "シーンを起動してエンティティの座標を読むのに使う"):
         return
 
-    profiles = _check_params_table(rom_path, labels, r)
+    # パラメータ表の検証（TSV と ROM の写しの突き合わせ）は、以降の節が
+    # profiles を使うので先に走らせる。ここが読めなければ profiles を要る節だけが落ちる。
+    profiles = None
+    if gate.need("AI パラメータ表の検証が走る",
+                 tuple("ai_p_" + c for c in PARAM_COLUMNS) + ("ai_default_profile",),
+                 "data/ai_params.tsv の写しと突き合わせるのに使う"):
+        profiles = _check_params_table(rom_path, labels, r)
+
+    sections = (
+        ("壁にならない",
+         ("ent_activate", "act_init_entity", "ai_init", "ai_goal", "ai_gap"),
+         _check_not_a_wall),
+        ("操作キャラのダウン",
+         ("ai_sit", "act_enter_down", "action_revive"), _check_leader_down),
+        ("敵が居なくなった後の追従", ("ai_goal", "ai_gap"), _check_regroup),
+        ("プロファイル番号の範囲",
+         ("ai_init_entity", "ai_default_profile", "ai_goal", "ai_gap"), _check_profile_range),
+        ("のけぞり中の入力",
+         ("act_damage", "act_atk_ent", "act_kb_dir", "act_kb_amt", "depth_y_min"),
+         _check_hurt_blocks_input),
+    )
     if profiles is None:
+        # 表が読めないと期待値（follow_x など）が作れない節がある。
+        # **その節だけ**を名指しで落とす（層ごと諦めない）。
+        for name, _needs, _fn in sections:
+            r.check("%s の検証が走る" % name, False,
+                    "AI パラメータ表（data/ai_params.tsv と ai_params.s の突き合わせ）が"
+                    "読めなかったので、期待値を作れないこの節を飛ばした。"
+                    "上のパラメータ表の失敗を先に直すこと")
         return
-
-    for name, fn in (("壁にならない", _check_not_a_wall),
-                     ("操作キャラのダウン", _check_leader_down),
-                     ("敵が居なくなった後の追従", _check_regroup),
-                     ("プロファイル番号の範囲", _check_profile_range),
-                     ("のけぞり中の入力", _check_hurt_blocks_input)):
-        try:
-            fn(rom_path, labels, profiles, r)
-        except CpuCrash as e:
-            r.check("%s の検証中にクラッシュしない" % name, False, str(e))
-        except Exception as e:      # noqa: BLE001 — 検証が例外で死ぬと原因が読めなくなる
-            r.check("%s の検証が最後まで走る" % name, False,
-                    "検証コードが %s で止まった: %s。AI の値が想定の範囲を外れている疑いがある"
-                    % (type(e).__name__, e))
+    run_sections(gate, sections, lambda fn: (rom_path, labels, profiles, r))
 
 
 # ---------------------------------------------------------------- パラメータ表
@@ -283,12 +309,12 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
     # 仲間が居ても居なくても、右へ押しっぱなしにしたときの到達Xが**完全に一致**すること。
     # 「ほぼ一致」では駄目である。1ドットでも変われば、仲間が操作キャラの移動に
     # 干渉する経路が存在するという意味になる（いまのエンジンに実体の押し合いは無いので、
-    # 干渉したならそれは AI が操作キャラの座標かレーンに手を出している）。
+    # 干渉したならそれは AI が操作キャラの座標か足元Yに手を出している）。
     FORWARD_FRAMES = 180
 
     def watch(s):
-        return (s.x(player), s.x(ally), s.get("ent_lane", player),
-                s.get("ent_lane", ally), s.alive(ally), s.alive(player))
+        return (s.x(player), s.x(ally), s.near_depth(player, ally),
+                s.alive(ally), s.alive(player))
 
     with_ally = Scene(rom_path, labels)
     # 最悪の場から走り出す: 仲間を操作キャラに**重ねて**置く。
@@ -297,7 +323,7 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
     # 一度も通らないまま「一致した」と言うことになる。重ねて始めれば、
     # 走り出しの数フレームで必ずその経路を通る。
     with_ally.set_x(ally, with_ally.x(player))
-    with_ally.put("ent_lane", ally, with_ally.get("ent_lane", player))
+    with_ally.put("ent_y", ally, with_ally.y(player))
     samples = with_ally.hold({"RIGHT"}, FORWARD_FRAMES, watch)
     x_with = with_ally.x(player)
 
@@ -306,13 +332,13 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
     without.hold({"RIGHT"}, FORWARD_FRAMES)
     x_without = without.x(player)
 
-    # 空振り防止: 仲間が生きていて、同じレーンに居て、近くまで寄っていたこと。
+    # 空振り防止: 仲間が生きていて、奥行きが重なる位置に居て、近くまで寄っていたこと。
     # 仲間が画面の彼方に居たのなら「一致して当然」であって、何も確かめていない。
-    near = [abs(px - ax) for px, ax, pl, al, aa, pa in samples if aa and pl == al]
-    r.check("仲間が生存して同レーンに居る状態で %d フレーム前進した（比較が空振りでない）"
-            % FORWARD_FRAMES,
+    near = [abs(px - ax) for px, ax, close, aa, pa in samples if aa and close]
+    r.check("仲間が生存して奥行きの重なる位置に居る状態で %d フレーム前進した"
+            "（比較が空振りでない）" % FORWARD_FRAMES,
             len(near) >= FORWARD_FRAMES // 2 and min(near or [999]) < OVERLAP_X,
-            "同レーンで生存していたのは %d フレーム（%d 中）、最接近 %s ドット。"
+            "奥行きが重なった状態で生存していたのは %d フレーム（%d 中）、最接近 %s ドット。"
             "仲間が近くに居ないまま比べても「前進量が一致」は何も意味しない"
             "（専有距離の押し出しを一度も通らない）。重ねて置いたはずの仲間が"
             "初手で離れている＝シーンの配置か追従（follow_x / leash_x）が変わっている"
@@ -322,7 +348,7 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
             % FORWARD_FRAMES, x_with == x_without,
             "仲間あり %d / 仲間なし %d（差 %d ドット）。自律仲間が操作キャラの前進を"
             "1ドットでも変えている＝**壁になっている**。いまのエンジンに実体の押し合いは"
-            "無いので、干渉するとすれば AI が操作キャラ(#%d)の座標・レーン・状態に"
+            "無いので、干渉するとすれば AI が操作キャラ(#%d)の座標・足元Y・状態に"
             "手を出している経路である（ai.s の走査範囲 AI_FIRST が操作キャラを含んでいないか）"
             % (x_with, x_without, abs(x_with - x_without), player))
 
@@ -336,20 +362,19 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
 
     def watch2(s):
         both = s.alive(player) and s.alive(ally)
-        same = s.get("ent_lane", player) == s.get("ent_lane", ally)
-        return (both, same, abs(s.x(player) - s.x(ally)))
+        return (both, s.near_depth(player, ally), abs(s.x(player) - s.x(ally)))
 
     edge_samples = edge.hold({"LEFT"}, EDGE_FRAMES, watch2)
     edge_restore()
     overlap = [(both and same and d < OVERLAP_X) for both, same, d in edge_samples]
     longest, total = _runs_of(overlap)
     live = [(same, d) for both, same, d in edge_samples if both]
-    r.check("操作キャラと仲間がともに生存して同レーンに居る状態を観測できた"
+    r.check("操作キャラと仲間がともに生存して奥行きが重なる位置に居る状態を観測できた"
             "（ワールド左端に %d フレーム押し込む）" % EDGE_FRAMES,
             sum(1 for same, _ in live if same) >= EDGE_FRAMES // 2,
-            "両者生存 %d フレーム / うち同レーン %d フレーム（%d 中）。"
+            "両者生存 %d フレーム / うち足元Yの差が %d ドット未満 %d フレーム（%d 中）。"
             "両者ダウン後は誰も動かないので、生存条件を外すとこの検証は空振りする"
-            % (len(live), sum(1 for same, _ in live if same), EDGE_FRAMES))
+            % (len(live), DEPTH_OVERLAP_Y, sum(1 for same, _ in live if same), EDGE_FRAMES))
     r.check("左端に押し込んでも仲間と操作キャラの重なり (|x差| < %d) が %d フレーム以上続かない"
             % (OVERLAP_X, OVERLAP_FRAMES_MAX + 1), longest <= OVERLAP_FRAMES_MAX,
             "重なりが最長 %d フレーム続いた（合計 %d フレーム / %d 中、最接近 %d ドット）。"
@@ -368,30 +393,29 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
     # 2体目は操作キャラを挟んで1体目の反対側に置く（1体目と同じ距離だけ右）。
     # 位置をテストに焼き付けず、シーンの配置から作る。
     mirror = pair.x(player) + (pair.x(player) - pair.x(ally))
-    ally2 = pair.place_second_ally(mirror, pair.get("ent_lane", player))
+    ally2 = pair.place_second_ally(mirror, pair.y(player))
 
     def watch3(s):
         both = s.alive(ally) and s.alive(ally2)
-        same = s.get("ent_lane", ally) == s.get("ent_lane", ally2)
-        return (both, same, abs(s.x(ally) - s.x(ally2)))
+        return (both, s.near_depth(ally, ally2), abs(s.x(ally) - s.x(ally2)))
 
     pair_samples = pair.hold(set(), PAIR_FRAMES, watch3)
     pair_overlap = [(both and same and d < OVERLAP_X) for both, same, d in pair_samples]
     longest2, total2 = _runs_of(pair_overlap)
-    same_lane = [d for both, same, d in pair_samples if both and same]
-    r.check("仲間2体がともに生存して同レーンに居る状態を観測できた（%d フレーム）" % PAIR_FRAMES,
-            len(same_lane) >= PAIR_FRAMES // 4,
-            "両者生存かつ同レーンだったのは %d フレーム（%d 中）。"
+    near = [d for both, close, d in pair_samples if both and close]
+    r.check("仲間2体がともに生存して奥行きが重なる位置に居る状態を観測できた（%d フレーム）"
+            % PAIR_FRAMES, len(near) >= PAIR_FRAMES // 4,
+            "両者生存かつ奥行きが重なっていたのは %d フレーム（%d 中）。"
             "2体目の配置（%d ドット）が遠すぎるか、片方が早々に戦線離脱している"
-            % (len(same_lane), PAIR_FRAMES, mirror))
+            % (len(near), PAIR_FRAMES, mirror))
     r.check("仲間どうしの重なり (|x差| < %d) が %d フレーム以上続かない"
             % (OVERLAP_X, OVERLAP_FRAMES_MAX + 1), longest2 <= OVERLAP_FRAMES_MAX,
-            "重なりが最長 %d フレーム続いた（合計 %d フレーム / %d 中、同レーン最小距離 %d ドット）。"
+            "重なりが最長 %d フレーム続いた（合計 %d フレーム / %d 中、最小の横距離 %d ドット）。"
             "同じ標的に寄った2体が同じ座標に潰れており、1スキャンライン8スプライトの制約で"
             "片方が消える。ai.s の ai_spread（番号順に AI_SPREAD ずつ後ろへずらす）が"
             "効いていないか、ai_clear_player_zone の押し出しが分散を**上書き**している"
             "（押された仲間が、押されていない仲間の立ち位置に重なる）"
-            % (longest2, total2, PAIR_FRAMES, min(same_lane) if same_lane else -1))
+            % (longest2, total2, PAIR_FRAMES, min(near) if near else -1))
 
 
 # ---------------------------------------------------------------- 操作キャラのダウン
@@ -485,7 +509,7 @@ def _check_profile_range(rom_path, labels, profiles, r):
         s = Scene(rom_path, labels)
         s.put("ent_ai", ally, profile_value)
         return s.hold(set(), FRAMES,
-                      lambda sc: (sc.x(ally), sc.get("ent_lane", ally),
+                      lambda sc: (sc.x(ally), sc.get("ent_y", ally),
                                   sc.get("ai_goal", ally), sc.get("ai_gap", ally)))
 
     base = trace(0)
@@ -533,10 +557,16 @@ def _check_profile_range(rom_path, labels, profiles, r):
 def _check_hurt_blocks_input(rom_path, labels, profiles, r):
     """のけぞり中は入力を受け付けないこと（仕様）。
 
-    engine のレーン検証から敵を取り除いた（l2_engine.py / run_tests.py）ぶん、
-    「戦闘中はレーン移動できない」という**仕様の側**をここで名指しで押さえる。
+    engine の奥行き検証から敵を取り除いた（l2_engine.py / run_tests.py）ぶん、
+    「戦闘中は奥行きを動かせない」という**仕様の側**をここで名指しで押さえる。
     見ているのは「入力が落ちる」ではなく「のけぞり中は受け付けない」であり、
     のけぞりが明けたら同じ入力が通ることまでを1組にしてある。
+
+    **レーンは ADR-0009 で廃止した。**この節はもともと ent_lane（レーン番号が
+    変わらないこと）で書いてあったが、主張はレーンに依らないので足元Y（ent_y）で
+    書き直した。押した量に応じて連続に動くようになったぶん、「1ドットも動かない」を
+    見ればよい。奥行きの速さ（ACT_DEPTH_SPEED）は主のノブなので、押すフレーム数は
+    その値から導いて焼き付けない。
     """
     r.section("のけぞり中は入力を受け付けない（ADR-0006 の猶予とは別物）")
     slots = slot_ranges(labels)
@@ -545,11 +575,15 @@ def _check_hurt_blocks_input(rom_path, labels, profiles, r):
     disarm_enemies(s.nes, labels)          # 殴る相手と時機をこちらで決める
     s.settle()
 
-    lane0, x0 = s.get("ent_lane", player), s.x(player)
+    # 1ドット動くのに要るフレーム数（1/16 ドット/f 刻み）。速さを下げても空振りしない。
+    push = max(2, 16 // max(1, D["ACT_DEPTH_SPEED"]) + 1)
+    depth_lo = s.get("depth_y_min")
+    y0, x0 = s.y(player), s.x(player)
     if not r.check("のけぞりの検証を始める前に操作キャラが待機状態で静止している",
-                   s.get("ent_state", player) == ACT_ST_IDLE and lane0 > 0,
-                   "ent_state=%d / ent_lane=%d。待機状態で、奥へ1つ動ける位置から始める"
-                   % (s.get("ent_state", player), lane0)):
+                   s.get("ent_state", player) == ACT_ST_IDLE and y0 > depth_lo,
+                   "ent_state=%d / ent_y=%d（歩ける帯の奥端は %d）。待機状態で、"
+                   "奥へまだ動ける位置から始める"
+                   % (s.get("ent_state", player), y0, depth_lo)):
         return
 
     # ノックバック 0 で1発入れる。位置が動かないので「入力で動いたか」だけを見られる。
@@ -563,36 +597,53 @@ def _check_hurt_blocks_input(rom_path, labels, profiles, r):
             "ent_state=%d（期待は待機(%d)とダウン(%d)の間）。act_damage がのけぞりに"
             "遷移させていない" % (hurt_state, ACT_ST_IDLE, ACT_ST_DOWN))
 
-    s.tap("UP")
-    lane_after = s.get("ent_lane", player)
-    step_after = s.get("ent_lane_step", player)
-    s.hold({"RIGHT"}, 3)
-    x_after = s.x(player)
-    s.settle()
-    r.check("のけぞり中の UP でレーンが変わらない",
-            lane_after == lane0 and step_after == 0,
-            "レーン %d → %d（補間の残り %d フレーム）。のけぞり・ヒットストップ中は"
-            "操作を受け付けないのが仕様であり、受け付けると被弾のたびに"
-            "レーンが飛ぶ（action_update_player が ACT_ST_IDLE 以外で戻っているか）"
-            % (lane0, lane_after, step_after))
-    r.check("のけぞり中の RIGHT で横に動かない（ノックバック 0 で殴っている）",
-            x_after == x0,
-            "ワールドX %d → %d。ノックバック初速 0 で殴ったので、動いたなら入力が"
-            "通っている。のけぞり中の入力は捨てること" % (x0, x_after))
-
-    # のけぞりが明けるまで待つ。明けたら同じ入力が通ること（塞がりっぱなしでない）。
+    # のけぞり（＋ヒットストップ）が明けるまで、UP と RIGHT を押しっぱなしにする。
+    # **押している間ずっと**足元YもワールドXも1ドットも動かないこと。
+    # 記録するのは「そのフレームの更新が終わった時点の (状態, 足元Y, X)」である。
+    # のけぞりが明けるフレームは、明けた**その同じフレーム**に入力が通る
+    # （act_update_actor が待機へ戻してから action_update_player が入力を読む）。
+    # そこで動くのは不具合ではないので、判定からは外す。外さずに数えると
+    # **action が正しいまま落ちる**検証になる。
+    samples = []
     waited = 0
-    while s.get("ent_state", player) != ACT_ST_IDLE and waited < 60:
-        s.settle()
+    LIMIT = 90
+    while s.get("ent_state", player) != ACT_ST_IDLE and waited < LIMIT:
+        s.hold({"UP"}, 1)
+        frame_end(s.nes, labels)
+        samples.append((s.get("ent_state", player), s.y(player), s.x(player)))
         waited += 1
-    if not r.check("のけぞりが %d フレーム以内に明ける" % 60,
+    s.nes.set_buttons(set())
+    states = [st for st, _, _ in samples]
+    ys = [y for st, y, _ in samples if st != ACT_ST_IDLE]
+    xs = [x for st, _, x in samples if st != ACT_ST_IDLE]
+
+    r.check("のけぞり中に UP を押し続けても足元Y（奥行き）が1ドットも動かない"
+            "（%d フレーム観測）" % len(ys),
+            bool(ys) and set(ys) == {y0},
+            "足元Y %d から %s と動いた（状態の推移=%s）。のけぞり・ヒットストップ中は"
+            "操作を受け付けないのが仕様であり、受け付けると被弾のたびに奥行きが飛ぶ"
+            "（action_update_player が ACT_ST_IDLE 以外で戻っているか、"
+            "act_player_depth が状態を見ずに呼ばれている）"
+            % (y0, sorted(set(ys)), states))
+    r.check("のけぞり中は横にも動かない（ノックバック 0 で殴っている）",
+            bool(xs) and set(xs) == {x0},
+            "ワールドX %d から %s と動いた。ノックバック初速 0 で殴ったので、"
+            "動いたなら入力が通っている" % (x0, sorted(set(xs))))
+
+    if not r.check("のけぞりが %d フレーム以内に明ける" % LIMIT,
                    s.get("ent_state", player) == ACT_ST_IDLE,
                    "%d フレーム待っても ent_state=%d のまま。のけぞりから待機へ戻らないと"
                    "操作が永久に効かない" % (waited, s.get("ent_state", player))):
         return
-    s.tap("UP")
-    r.check("のけぞりが明けたら同じ UP が通る（塞がったままにならない）",
-            s.get("ent_lane", player) == lane0 - 1,
-            "レーン %d（期待 %d）。のけぞり中に入力を受け付けないことと、"
-            "のけぞりが明けても受け付けないことは別物である。後者なら操作不能の不具合"
-            % (s.get("ent_lane", player), lane0 - 1))
+
+    # 明けたら同じ入力が通ること（塞がりっぱなしでない）。
+    s.hold({"UP"}, push)
+    frame_end(s.nes, labels)
+    s.nes.set_buttons(set())
+    y_after = s.y(player)
+    r.check("のけぞりが明けたら同じ UP が通り、足元Yが奥へ動く",
+            y_after < y0,
+            "足元Y %d → %d（%d フレーム押した。奥へ＝Yが小さくなる向き）。"
+            "のけぞり中に入力を受け付けないことと、のけぞりが明けても受け付けないことは"
+            "別物である。後者なら操作不能の不具合"
+            % (y0, y_after, push))
