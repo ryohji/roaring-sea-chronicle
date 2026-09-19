@@ -21,7 +21,11 @@ PLAYER_HOME_X    = 120
 PLAYER_HOME_LANE = 2
 PLAYER_SPEED     = 1          ; 手触りの値ではない。動きが見えればよい
 PLAYER_EDGE_MARGIN = 16       ; ステージ右端に残す余白（体1つぶん）
-TEST_TILE_FIGURE = 0          ; 仮CHR: タイル0/1 が 8x16 の人型
+; 仮CHR のタイル割当（tools/mk_placeholder_chr.py と対応）。
+; 役割ごとに輪郭の違う絵を割り当てる。色だけで見分けさせない。
+TILE_PLAYER = 0               ; 操作キャラ 6姿勢 (0,2,4,6,8,10)
+TILE_ALLY   = 16              ; 仲間
+TILE_ENEMY  = 32              ; 敵
 TEST_ATTR_PLAYER = 0          ; スプライトパレット0
 TEST_ATTR_ENEMY  = 1          ; スプライトパレット1
 TEST_ATTR_ALLY   = 2          ; スプライトパレット2（仲間）
@@ -112,7 +116,7 @@ TEST_ENEMY_COUNT = 3
         sta ent_class, x
         lda #BODY_PLACEHOLDER
         sta ent_body, x
-        lda #TEST_TILE_FIGURE
+        lda #TILE_PLAYER
         sta ent_tile, x
         lda #TEST_ATTR_PLAYER
         sta ent_attr, x
@@ -134,7 +138,7 @@ TEST_ENEMY_COUNT = 3
         sta ent_body, x
         lda #AI_PROFILE_ALLY
         sta ent_ai, x
-        lda #TEST_TILE_FIGURE
+        lda #TILE_ALLY
         sta ent_tile, x
         lda #TEST_ATTR_ALLY
         sta ent_attr, x
@@ -157,7 +161,7 @@ TEST_ENEMY_COUNT = 3
         sta ent_class, x
         lda #AI_PROFILE_ENEMY
         sta ent_ai, x
-        lda #TEST_TILE_FIGURE
+        lda #TILE_ENEMY
         sta ent_tile, x
         lda #TEST_ATTR_ENEMY
         sta ent_attr, x
