@@ -14,24 +14,19 @@
 .include "zeropage.inc"
 
 .export ent_active, ent_x_lo, ent_x_hi, ent_y
-.export ent_lane, ent_lane_from, ent_lane_step, ent_lane_acc, ent_lane_dy
 .export ent_state, ent_class, ent_body, ent_ai, ent_tile, ent_attr
 .export ent_tile0
 .export ent_clear_all, ent_activate, ent_kill, ent_find_free, ent_set_pose
 
-.import lane_y_of
+.import depth_clamp
 
 .segment "BSS"
 
 ent_active:     .res MAX_ENTITIES   ; ENT_INACTIVE / ENT_ACTIVE
 ent_x_lo:       .res MAX_ENTITIES   ; ワールドX 下位（16bit。ステージは横に長い）
 ent_x_hi:       .res MAX_ENTITIES   ; ワールドX 上位
-ent_y:          .res MAX_ENTITIES   ; 足元の画面Y。レーン移動中は補間された中間値が入る
-ent_lane:       .res MAX_ENTITIES   ; レーン番号 0..LANE_LAST（移動中は「目標」レーン）
-ent_lane_from:  .res MAX_ENTITIES   ; 移動中の出発レーン（ent_lane_step が 0 でない間だけ有効）
-ent_lane_step:  .res MAX_ENTITIES   ; レーン補間の残りフレーム数。0 なら静止
-ent_lane_acc:   .res MAX_ENTITIES   ; レーン補間の累算器（lane.s の内部用）
-ent_lane_dy:    .res MAX_ENTITIES   ; レーン補間の総Y移動量（符号つき。lane.s の内部用）
+ent_y:          .res MAX_ENTITIES   ; 足元の画面Y。**奥行きそのもの**（連続。ADR-0009）。
+                                    ; 歩ける帯の中に居ることは src/engine/depth.s が保つ
 ent_state:      .res MAX_ENTITIES   ; 状態 ID。語彙を決めるのは action-dev
 ent_class:      .res MAX_ENTITIES   ; SPR_CLASS_*（OAM 並べ替えの重み。ADR-0002）
 ent_body:       .res MAX_ENTITIES   ; BODY_*（描画タイル数が変わる）
@@ -50,38 +45,30 @@ ent_tile0:      .res MAX_ENTITIES   ; 役割の先頭タイル（SPR_ROLE_*）�
         ldx #MAX_ENTITIES - 1
 @loop:
         sta ent_active, x
-        sta ent_lane_step, x
-        sta ent_lane_acc, x
-        sta ent_lane_dy, x
         dex
         bpl @loop
         rts
 .endproc
 
-; X = エンティティ番号。呼ぶ前に ent_x_lo/hi, ent_lane, ent_class, ent_body,
+; X = エンティティ番号。呼ぶ前に ent_x_lo/hi, ent_y, ent_class, ent_body,
 ; ent_tile, ent_attr を詰めておくこと（SoA なので呼び出し側が直接書くのが速い）。
-; ここでは「有効化」と、レーンから足元Yを決めることだけを行う。
+; ここでは「有効化」と、足元Yを歩ける帯に収めることだけを行う。
 ;
 ; ついでに2つ、**置いた側が忘れても成立する**ようにしてある:
 ;   * ent_tile を役割の先頭タイル ent_tile0 として覚える（以降は ent_set_pose で姿勢を切る）
-;   * 足元に影を敷く印 (ENT_ATTR_SHADOW) を立てる。影は奥行き（レーン）を画面に出す唯一の
+;   * 足元に影を敷く印 (ENT_ATTR_SHADOW) を立てる。影は奥行きを画面に出す唯一の
 ;     手がかりなので、既定を「敷く」にしてある。接地していないもの（効果・飛び道具）だけが
 ;     有効化のあとで下ろすこと。
 .proc ent_activate
         lda #ENT_ACTIVE
         sta ent_active, x
-        lda #0
-        sta ent_lane_step, x            ; 補間中でない
-        sta ent_lane_acc, x
-        sta ent_lane_dy, x
         lda ent_tile, x
         sta ent_tile0, x                ; 役割の先頭タイルを覚える
         lda ent_attr, x
         ora #ENT_ATTR_SHADOW
         sta ent_attr, x
-        lda ent_lane, x
-        sta ent_lane_from, x
-        jsr lane_y_of                   ; A = そのレーンの足元Y（X は壊さない）
+        lda ent_y, x
+        jsr depth_clamp                 ; 歩ける帯に収める（置いた側が帯を知らなくてよい）
         sta ent_y, x
         rts
 .endproc

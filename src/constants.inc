@@ -159,9 +159,6 @@ VQ_STEP_ATTR = VQ_STEP | ATTR_COLS       ; = STEP 増分 8
 .assert (<NT_ATTR_OFFSET) + (ATTR_COLS - 1) + ATTR_COLS * (ATTR_ROWS - 1) <= $FF, error, "属性列の STEP 転送がページ境界をまたぐ（転送先が別のページに化ける）"
 
 ; ---- ゲーム基本定数 ----
-; レーン数は4に固定。ADR なしに変更してはならない（CLAUDE.md 第5条）。
-LANE_COUNT = 4
-
 ; 1画面の敵同時数。ADR-0002（案B: 敵同時6体・フリッカー許容）で決定済み。
 MAX_ENEMIES = 6
 
@@ -182,22 +179,16 @@ SPR_CLASS_FAR_ENE  = 3   ; それ以外の敵、および自律仲間
 SPR_CLASS_EFFECT   = 4   ; エフェクト・UI。消えても遊びが壊れない
 SPR_CLASS_COUNT    = 5
 
-; ---- 擬似奥行きレーンの座標系 ----
-; レーン番号 0 が最も奥（画面上方）、LANE_COUNT-1 が最も手前（画面下方）。
-; レーン番号 → 画面Y の対応表は src/engine/lane.s の lane_ground_y にある（等間隔ではない）。
-LANE_FIRST = 0
-LANE_LAST  = LANE_COUNT - 1
-
-; レーン移動にかける補間フレーム数。手触りのパラメータなのでここで調整する。
+; ---- 擬似奥行き ----
+; **レーンは ADR-0009 で廃止した。奥行きは連続である。**
+; 足元Y（ent_y）が「歩ける帯」の中を連続に動く。レーン番号という概念はもう無い。
+; 帯の上下限は定数ではなく変数である（src/engine/depth.s の depth_y_min / depth_y_max）。
+; 既定値の定義は ENT_Y_TO_OAM の直後（DEPTH_Y_MIN_DEFAULT / DEPTH_Y_MAX_DEFAULT）にある。
 ;
-; lane.s の補間は 8bit の累算で刻む。実際の制約は2つある:
-;   * レーン間のY差が ±127 に収まること。総移動量 ent_lane_dy が符号つき8bit なので、
-;     lane_ground_y のどの2要素の差もこれを超えてはならない。
-;   * (LANE_MOVE_FRAMES - 1) + レーン間の最大Y差 <= 255 であること。
-;     累算器 ent_lane_acc は「1フレームぶん足してから LANE_MOVE_FRAMES ずつ引く」
-;     順で動くので、引く前の一瞬だけこの値まで大きくなる。
-; いまの表（148/160/176/196、最大Y差 48）では、どちらの制約にも大きく余裕がある。
-LANE_MOVE_FRAMES = 8
+; **暫定**: LANE_LAST だけは、まだ src/action/player.s が参照しているので残してある。
+; レーン番号は常に 0（src/engine/lane_compat.s）なので、上限も 0 である。
+; action-dev が移行したら、この1行と src/engine/lane_compat.s を消すこと。
+LANE_LAST = 0
 
 ; ---- エンティティテーブル ----
 ; Structure of Arrays（属性ごとに1配列）。実体と各配列のラベルは src/engine/entity.s。
@@ -292,6 +283,29 @@ FX_MAX = 6
 ; この値の大小で決まるので、描画の基準点を足元に置いておくと並べ替えが素直になる。
 ; OAM の Y バイトは実際の表示より1ライン上にずれる仕様なので、その1も含めて引く。
 ENT_Y_TO_OAM = SPRITE_H + 1
+
+; 歩ける帯（足元Yの上下限）の既定値。**実体は変数である**（src/engine/depth.s の
+; depth_y_min / depth_y_max）。ステージ長（scroll.s の stage_w）と同じ扱いで、
+; P3 で stage-author が data/layouts/ から depth_set_band を呼べば置き換わる。
+; ここにあるのは、その表が入るまでの初期値にすぎない。**判定の閾値ではない。**
+;
+; 奥端 148 … 仮背景の「床の奥の縁」の行（src/engine/bg.s の BG_ROW_EDGE = 18、Y=144..151）に
+;            接地線を置いた値。これより奥は壁であり、立てる床が無い。
+;            画面上部3行はステータスバー（P2 で MMC3 スキャンライン IRQ で分割）の余白なので、
+;            そちらには近づかない（頭の位置 148-16 = 132 は、なお壁の中である）。
+; 手前端 212 … 画面下端 239 まで 27 ドット（3行ぶん強）残した値。
+;            CRT の下端はおよそ8ライン切れる。手前側の前景の余白もここから取る。
+; 帯の高さ 64 ドット（8タイル行）。レーン時代の 148..196（48 ドット）から広げてある。
+; 連続にした以上、段の間隔ではなく帯の広さが奥行きの見え方を決めるためである。
+; 64 は「床として見えている範囲（Y=152..239）に収まる、きりのよい最大幅」として選んだ。
+DEPTH_Y_MIN_DEFAULT = 148
+DEPTH_Y_MAX_DEFAULT = 212
+
+; 帯が OAM に載る範囲に収まっていること。下端の足元Yは OAM の Y バイトで
+; ENT_Y_TO_OAM ぶん上にずれる。奥端がこれより小さいと借りが出て描画されない。
+.assert DEPTH_Y_MIN_DEFAULT >= ENT_Y_TO_OAM, error, "歩ける帯の奥端が上すぎる（OAM の Y 計算で借りが出る）"
+.assert DEPTH_Y_MAX_DEFAULT < $EF, error, "歩ける帯の手前端が画面の外にある"
+.assert DEPTH_Y_MIN_DEFAULT < DEPTH_Y_MAX_DEFAULT, error, "歩ける帯の上下が逆になっている"
 
 ; OAM 並べ替えキーの詰め方: 上位3bit = 優先度クラス / 下位5bit = 奥行き（足元Yの粗い階調）。
 ; 値が小さいほど OAM の先頭に置かれる（＝前面に描かれ、8スプライト制約で生き残る）。

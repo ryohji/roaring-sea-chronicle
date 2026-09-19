@@ -7,6 +7,7 @@
 .import mmc3_init, mmc3_set_mirroring
 .import oam_shadow
 .import scroll_init
+.import depth_init
 
 .segment "CODE"
 
@@ -74,6 +75,7 @@
         sta ppu_ctrl_shadow
 
         jsr load_palette
+        jsr depth_init           ; 歩ける帯（足元Yの上下限）を既定値に置く
         jsr scroll_init          ; カメラを原点に置き、そこから見える仮背景を書く
 
         ; PPUMASK のシャドウは**初期転送が終わってから**置く。

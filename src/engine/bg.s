@@ -33,9 +33,9 @@ BG_TILE_FLOOR_B = 5
 
 BG_PILLAR_MASK  = 7      ; (列 & これ) == 0 の列に柱を立てる
 
-; --- 行の帯。レーンの足元Y（src/engine/lane.s の lane_ground_y = 148/160/176/196）が
-;     床の帯に載るように切ってある。上の3行は、P2 で MMC3 IRQ で分割する
-;     ステータスバーのための余白である。
+; --- 行の帯。歩ける帯（src/engine/depth.s の depth_y_min / depth_y_max。既定 148..212）が
+;     床の帯に載るように切ってある。床の奥の縁（BG_ROW_EDGE）が帯の奥端である。
+;     上の3行は、P2 で MMC3 IRQ で分割するステータスバーのための余白である。
 BG_ROW_WALL_TOP = 3      ; 0..2 空白
 BG_ROW_EDGE     = 18     ; 3..17 壁 / 18 床の奥の縁 / 19.. 床
 .assert BG_ROW_EDGE < SCREEN_TILES_H, error, "床の縁が画面の外にある"

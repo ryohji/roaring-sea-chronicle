@@ -4,10 +4,10 @@
 
 .export reset_handler
 .import init_system, read_pad
-.import ent_clear_all, ent_activate, ent_lane_move
-.import ent_x_lo, ent_x_hi, ent_lane, ent_lane_step
+.import ent_clear_all, ent_activate
+.import ent_x_lo, ent_x_hi, ent_y
 .import ent_state, ent_class, ent_body, ent_tile, ent_attr
-.import lane_update_all, oam_build, cam_update
+.import oam_build, cam_update
 .import fx_clear_all, fx_update
 .import action_init, action_update
 .import ai_init, ai_update
@@ -15,11 +15,13 @@
 .import stage_w_lo, stage_w_hi
 
 ; --- P1 の動作確認用シーンのパラメータ ---
-; ここにあるのは engine の経路（入力 → エンティティ → レーン補間 → OAM → 画面）が
+; ここにあるのは engine の経路（入力 → エンティティ → OAM → 画面）が
 ; 繋がっていることを確かめるための仮置きである。ステージの中身は P3 で
 ; stage-author が data/ から読む形に置き換える。ここに固有名詞を増やしてはならない。
 PLAYER_HOME_X    = 120
-PLAYER_HOME_LANE = 2
+; 足元Y の初期値。歩ける帯（既定 DEPTH_Y_MIN_DEFAULT..DEPTH_Y_MAX_DEFAULT）の
+; まんなかに置く。レーン番号ではない（ADR-0009）。
+PLAYER_HOME_Y    = (DEPTH_Y_MIN_DEFAULT + DEPTH_Y_MAX_DEFAULT) / 2
 PLAYER_SPEED     = 1          ; 手触りの値ではない。動きが見えればよい
 PLAYER_EDGE_MARGIN = 16       ; ステージ右端に残す余白（体1つぶん）
 ; 仮CHR のタイル割当は src/constants.inc の SPR_ROLE_* が持つ
@@ -87,7 +89,6 @@ TEST_ENEMY_COUNT = 3
         jsr fx_update           ; 短命の効果の寿命。**action / ai が出す前に**減らす
         jsr action_update       ; 操作・攻撃・ダウンは src/action/ が持つ
         jsr ai_update           ; 自律仲間と敵の思考・行動は src/ai/ が持つ
-        jsr lane_update_all
         jsr cam_update          ; カメラ追従 + 現れた列を転送キューへ
         jsr oam_build
         jmp @frame
@@ -104,7 +105,7 @@ TEST_ENEMY_COUNT = 3
 .endproc
 
 ; --- P1 の動作確認用シーン ---
-; 操作キャラ1体と、静止した敵3体を別々のレーンに置く。
+; 操作キャラ1体と、敵3体を別々の奥行き（足元Y）に置く。
 ; 敵の思考（AI）は ai-dev の範囲なので書かない。ここでは「置くだけ」である。
 .proc scene_test_init
         jsr ent_clear_all
@@ -115,8 +116,8 @@ TEST_ENEMY_COUNT = 3
         sta ent_x_lo, x
         lda #>PLAYER_HOME_X
         sta ent_x_hi, x
-        lda #PLAYER_HOME_LANE
-        sta ent_lane, x
+        lda #PLAYER_HOME_Y
+        sta ent_y, x
         lda #SPR_CLASS_PLAYER
         sta ent_class, x
         lda #BODY_PLACEHOLDER
@@ -135,8 +136,8 @@ TEST_ENEMY_COUNT = 3
         sta ent_x_lo, x
         lda #>ALLY_HOME_X
         sta ent_x_hi, x
-        lda #PLAYER_HOME_LANE
-        sta ent_lane, x
+        lda #PLAYER_HOME_Y
+        sta ent_y, x
         lda #SPR_CLASS_FAR_ENE
         sta ent_class, x
         lda #BODY_PLACEHOLDER
@@ -158,8 +159,8 @@ TEST_ENEMY_COUNT = 3
         sta ent_x_lo, x
         lda #0
         sta ent_x_hi, x
-        lda test_enemy_lane, y
-        sta ent_lane, x
+        lda test_enemy_y, y
+        sta ent_y, x
         lda test_enemy_body, y
         sta ent_body, x
         lda #SPR_CLASS_FAR_ENE
@@ -185,17 +186,19 @@ TEST_ENEMY_COUNT = 3
 .endproc
 
 ; 十字キーで操作キャラを動かす。手触りの実装ではなく、
-; 「入力 → エンティティ → レーン補間 → OAM → 画面」の経路の確認である。
+; 「入力 → エンティティ → OAM → 画面」の経路の確認である。
 ;   左右: ワールドX を動かす（16bit）
-;   上下: レーンを1つ移動する（押した瞬間だけ。移動は lane.s が補間する）
+;   上下: 足元Y を連続に動かす（歩ける帯でクランプする。補間はしない。ADR-0009）
 
 .segment "RODATA"
 
-; 確認用の敵の配置。レーンごとの前後関係と体格型ごとのタイル数が
-; 画面で見えるように、別レーン・別体格で置いてある。
+; 確認用の敵の配置。奥行きごとの前後関係と体格型ごとのタイル数が
+; 画面で見えるように、別の足元Y・別体格で置いてある。
+; 帯の両端（DEPTH_Y_MIN_DEFAULT / DEPTH_Y_MAX_DEFAULT）を含めてあるのは、
+; 歩ける帯の広さが画面で分かるようにするためである。
 test_enemy_x:
         .byte 64, 176, 112
-test_enemy_lane:
-        .byte 0, 1, LANE_LAST
+test_enemy_y:
+        .byte DEPTH_Y_MIN_DEFAULT, PLAYER_HOME_Y, DEPTH_Y_MAX_DEFAULT
 test_enemy_body:
         .byte BODY_HEAVY, BODY_LIGHT, BODY_PLACEHOLDER

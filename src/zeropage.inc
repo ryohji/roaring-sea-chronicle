@@ -72,7 +72,7 @@ ZEROPAGE_INC = 1
 ; （fx_spawn が枠へ写し取るまでの受け渡しにしか使わない）。
 ; 使うのは action-dev / ai-dev である。engine は「出す仕組み」までしか持たない。
 .globalzp fx_arg_x_lo, fx_arg_x_hi   ; ワールドX（16bit）
-.globalzp fx_arg_y                   ; 足元（接地線）の画面Y。レーンから引くなら lane_y_of
+.globalzp fx_arg_y                   ; 足元（接地線）の画面Y（＝奥行き。ent_y をそのまま入れる）
 .globalzp fx_arg_tile                ; タイル番号（SPR_TILE_*。偶数であること）
 .globalzp fx_arg_attr                ; OAM 属性（パレットと反転。SPR_PAL_EFFECT が既定）
 .globalzp fx_arg_life                ; 寿命（フレーム数。1 以上）

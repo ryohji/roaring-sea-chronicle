@@ -18,7 +18,7 @@
 ;     sta fx_arg_x_lo
 ;     lda #>world_x
 ;     sta fx_arg_x_hi
-;     lda ent_y, x           ; 足元（接地線）の画面Y。レーン番号から引くなら fx_spawn_lane
+;     lda ent_y, x           ; 足元（接地線）の画面Y。奥行きはこの値そのものである
 ;     sta fx_arg_y
 ;     lda #SPR_TILE_SWIPE
 ;     sta fx_arg_tile
@@ -35,9 +35,7 @@
 .include "zeropage.inc"
 
 .export fx_life, fx_x_lo, fx_x_hi, fx_y, fx_tile, fx_attr
-.export fx_clear_all, fx_spawn, fx_spawn_lane, fx_update
-
-.import lane_y_of
+.export fx_clear_all, fx_spawn, fx_update
 
 .segment "BSS"
 
@@ -61,14 +59,6 @@ fx_attr:  .res FX_MAX        ; OAM 属性
         dex
         bpl @loop
         rts
-.endproc
-
-; A = レーン番号。そのレーンの接地線に出す。ほかの引数は fx_spawn と同じ。
-; レーン番号 → 足元Y の対応を呼び出し側に持たせないための入口である。
-.proc fx_spawn_lane
-        jsr lane_y_of                    ; A = そのレーンの足元Y（X は壊さない）
-        sta fx_arg_y
-        ; fx_spawn へ落ちる
 .endproc
 
 ; fx_arg_* を空き枠へ写す。
