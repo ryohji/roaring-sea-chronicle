@@ -16,7 +16,7 @@
 .include "ai_params.inc"
 
 .export ai_p_speed, ai_p_hold_x, ai_p_reach_x, ai_p_aggr_x
-.export ai_p_follow_x, ai_p_leash_x, ai_p_atk_gap, ai_p_lane_hold, ai_p_item_pri
+.export ai_p_follow_x, ai_p_leash_x, ai_p_atk_gap, ai_p_depth_spd, ai_p_item_pri
 .export ai_default_profile
 
 .segment "RODATA"
@@ -26,7 +26,7 @@
 ;
 ;   id 0  ally_versatile  万能（自律仲間）
 ;         6型の中では**すべての値が中庸**である。P2 で他の5型が入ったとき、
-;         突撃は hold_x と atk_gap をこれより小さく・aggr_x を大きく、
+;         突撃は hold_x と atk_gap をこれより小さく・aggr_x と depth_spd を大きく、
 ;         遠隔は hold_x を大きく、庇護は follow_x と leash_x を小さく、
 ;         牽制は reach_x に対して hold_x を大きめに取る。
 ;         万能はそのどれでもない位置に置く（＝この行が基準線になる）。
@@ -44,7 +44,7 @@ ai_p_hold_x:                     ; 好む間合い（標的との横距離・ド
         .byte 12                 ; enemy_melee     近接
 .assert * - ai_p_hold_x = AI_PROFILE_COUNT, error, "ai_p_hold_x の行数がプロファイル数と違う"
 
-ai_p_reach_x:                    ; 攻撃に移る閾値（この距離以内・同レーンで振る）
+ai_p_reach_x:                    ; 攻撃に移る閾値（奥行きを合わせ切った上で、この横距離以内なら振る）
         .byte 20                 ; ally_versatile
         .byte 20                 ; enemy_melee
 .assert * - ai_p_reach_x = AI_PROFILE_COUNT, error, "ai_p_reach_x の行数がプロファイル数と違う"
@@ -69,10 +69,10 @@ ai_p_atk_gap:                    ; 攻撃の間隔（フレーム）
         .byte 54                 ; enemy_melee     1秒弱に1回。捌ける手数
 .assert * - ai_p_atk_gap = AI_PROFILE_COUNT, error, "ai_p_atk_gap の行数がプロファイル数と違う"
 
-ai_p_lane_hold:                  ; レーン移動の積極性（小さいほど積極的・フレーム）
-        .byte 20                 ; ally_versatile  中庸
-        .byte 36                 ; enemy_melee     鈍い（レーンをずらせば振り切れる）
-.assert * - ai_p_lane_hold = AI_PROFILE_COUNT, error, "ai_p_lane_hold の行数がプロファイル数と違う"
+ai_p_depth_spd:                  ; 奥行きの寄り足の速さ（1/16 ドット/f。**大きいほど積極的**）
+        .byte 13                 ; ally_versatile  横(26)の半分。中庸
+        .byte 8                  ; enemy_melee     鈍い（奥行きをずらせば振り切れる）
+.assert * - ai_p_depth_spd = AI_PROFILE_COUNT, error, "ai_p_depth_spd の行数がプロファイル数と違う"
 
 ai_p_item_pri:                   ; アイテム回収の優先度。**P1 では読まれない**（アイテムが無い）
         .byte 128                ; ally_versatile  中庸（回収型は P2 でこれより大きくする）

@@ -18,11 +18,11 @@
 
 ; --- 付随テーブル（エンティティ番号で引く。engine の SoA と同じ添字）---
 .export act_hp, act_timer, act_step, act_face, act_invuln, act_hitstop
-.export act_kb, act_flags, act_attr0, act_sub
+.export act_kb, act_flags, act_attr0, act_sub, act_dsub
 ; --- 作業変数（engine 呼び出しをまたいでも保つ必要がある）---
 .export act_px, act_t0, act_t1, act_t2, act_t3
 .export act_atk_ent, act_scan_end, act_kb_dir, act_kb_amt, act_dmg_amt
-.export act_ld0, act_ld1, act_la0, act_la1
+.export act_dy, act_tol
 ; --- 外に見せる状態 ---
 .export act_ready, act_player_failed
 ; --- 手続き ---
@@ -31,9 +31,9 @@
 .export act_enter_down, act_grace_expired, action_revive
 
 .import ent_active, ent_state, ent_attr, ent_body
-.import ent_x_lo, ent_x_hi, ent_kill
+.import ent_x_lo, ent_x_hi, ent_kill, ent_set_pose
 .import stage_w_lo, stage_w_hi
-.import act_grace_frames, act_hp_by_body
+.import act_grace_frames, act_hp_by_body, act_pose_by_state
 .import act_attack_step, act_damage
 .import act_input_gate, act_input_buffer, act_input_drop, action_update_player
 .import act_pad_new
@@ -50,6 +50,7 @@ act_kb:       .res MAX_ENTITIES   ; ノックバック速度（符号つき・�
 act_flags:    .res MAX_ENTITIES   ; ACT_F_*
 act_attr0:    .res MAX_ENTITIES   ; 本来の ent_attr（点滅から戻すために覚えておく）
 act_sub:      .res MAX_ENTITIES   ; 横移動の小数部（1/16 ドット）
+act_dsub:     .res MAX_ENTITIES   ; 奥行き移動の小数部（1/16 ドット）。ADR-0009
 
 act_px:       .res 1              ; 今回動かすドット数
 act_t0:       .res 1              ; 16bit 計算の作業
@@ -61,10 +62,8 @@ act_scan_end: .res 1              ; 走査する標的区画の終端（この�
 act_kb_dir:   .res 1              ; 与えるノックバックの向き（0 = 右 / 1 = 左）
 act_kb_amt:   .res 1              ; 与えるノックバックの初速
 act_dmg_amt:  .res 1              ; 与えるダメージ
-act_ld0:      .res 1              ; レーン判定の作業（防御側の実効レーン2つ）
-act_ld1:      .res 1
-act_la0:      .res 1              ; 同（攻撃側）
-act_la1:      .res 1
+act_dy:       .res 1              ; 奥行き判定の作業（攻撃側と被弾側の足元Yの差）
+act_tol:      .res 1              ; 同（その組み合わせのY許容幅）
 act_ready:    .res 1              ; action_init 済みか（0 = まだ）
 ; 操作キャラの猶予が切れた = シナリオ失敗（ADR-0005）。
 ; **ここで立てるのはフラグまで**である。失敗の演出とオートセーブからの再開は
@@ -108,6 +107,7 @@ act_player_failed: .res 1
         sta act_kb, x
         sta act_flags, x
         sta act_sub, x
+        sta act_dsub, x
         sta act_hp, x
         lda ent_active, x
         beq @done
@@ -314,6 +314,7 @@ act_player_failed: .res 1
         sta act_hitstop, x
         sta act_flags, x
         sta act_sub, x
+        sta act_dsub, x
         lda #ACT_REVIVE_INVULN
         sta act_invuln, x
         cpx #ENT_PLAYER
@@ -365,9 +366,20 @@ act_player_failed: .res 1
         rts
 .endproc
 
+; X = エンティティ番号。「今フレーム動いた」印を立てる。A を壊す。
+.proc act_mark_moved
+        lda act_flags, x
+        ora #ACT_F_MOVED
+        sta act_flags, x
+        rts
+.endproc
+
 ; X = エンティティ番号, act_px = ドット数。ワールドの左端 (0) を越えさせない。
 ; 越えると 16bit が巻き取って「ステージの遥か右」になり、カメラが飛ぶ。
+; ついでに「今フレーム動いた」を立てる。歩きの絵に切り替えるためであり、
+; **プレイヤーと AI のどちらが動かしても同じように歩いて見える**ようにここに置いてある。
 .proc act_move_left
+        jsr act_mark_moved
         lda ent_x_lo, x
         sec
         sbc act_px
@@ -389,6 +401,7 @@ act_player_failed: .res 1
 ; X = エンティティ番号, act_px = ドット数。ステージ右端（幅 - 余白）で止める。
 ; ステージ幅は scroll.s が持っている。ここに長さを埋めない。
 .proc act_move_right
+        jsr act_mark_moved
         lda ent_x_lo, x
         clc
         adc act_px
@@ -426,12 +439,21 @@ act_player_failed: .res 1
 .endproc
 
 ; ==========================================================================
-; 提示 — 「今は何をしても動かない」が分かること（ADR-0006）
+; 提示 — いま何が起きているかを画面に出す（ADR-0006 の UI 要件 ＋ P1 の受入指摘）
 ; ==========================================================================
-; 仮CHR には攻撃・ダウンの絵が無いので、スプライトのパレット番号だけで示す。
-; 無反応は不具合と区別がつかない、というのが ADR-0006 の要求である。
-; 猶予の残り時間は**点滅の速さ**で見せる（残りが少ないほど速い）。
-; 本番の絵とUI（残り時間の数値表示など）は P8。
+; **姿勢（絵）が主で、色は補助である。**
+;
+; P1 の受入で主が指摘した「攻撃とダメージ硬直の違いがわからない」は、
+; 姿勢が1つしか無く、攻撃中も被弾中も同じ絵だったことによる。
+; 6姿勢（立ち・歩き・構え・斬り・のけぞり・ダウン）が入ったので、状態ごとに
+; ent_set_pose で絵を切り替える。割り当ては action_params.s の act_pose_by_state。
+; **斬りは前へ、のけぞりは後ろへ折れる**ので、同じ「止まっている」フレームでも
+; 攻撃の硬直か殴られた硬直かが見分けられる。
+;
+; 色は「本来の色 ⇄ ACT_PAL_BLINK」の点滅だけに使う。無敵中とダウン中（猶予中）で
+; 点滅の速さが違い、猶予の残りが ACT_DOWN_WARN を切るとさらに速くなる。
+; **無反応は不具合と区別がつかない**（ADR-0006）ので、猶予の残り時間は速さで見せる。
+; 数値表示などの本格的な UI は P8。
 ;
 ; ダウン中も優先度クラス（ent_class）は変えない。操作キャラを class 3 に落とすと
 ; フリッカーで消えうるが、それでは ADR-0006 の「猶予中だと分かる提示」が成立しない。
@@ -450,13 +472,21 @@ act_player_failed: .res 1
         rts
 .endproc
 
-; X = エンティティ番号。
+; X = エンティティ番号。姿勢を決めてから色を決める。X は保存して返る。
 .proc act_present
+        jsr act_pose_for_state
+        ; 「今フレーム動いた」は**読んだ直後に下ろす**。ここで下ろすのが要点で、
+        ; フレームの頭で下ろすと AI が動かす仲間・敵が歩いて見えない
+        ; （ai_update は action_update の**後**に走るので、印が立つのは提示の後になる）。
+        ; 読んでから下ろせば、操作キャラは同じフレーム・AI 側は次のフレームに歩きが出る。
+        lda act_flags, x
+        and #<~ACT_F_MOVED
+        sta act_flags, x
         lda ent_state, x
-        cmp #ACT_ST_DOWN
-        beq @down
         cmp #ACT_ST_OUT
         beq @out
+        cmp #ACT_ST_DOWN
+        beq @down
         lda act_invuln, x
         bne @invuln
 .if ::ACT_SHOW_ACTIVE
@@ -470,17 +500,17 @@ act_player_failed: .res 1
         rts
 .if ::ACT_SHOW_ACTIVE
 @active:
-        lda #ACT_PAL_ACTIVE              ; 攻撃判定が出ているフレーム
+        lda #ACT_PAL_ACTIVE              ; 攻撃判定が出ているフレーム（既定では使わない）
         jmp act_set_pal
 .endif
 @invuln:
         lda #ACT_BLINK_HURT
         and frame_counter
         beq @base
-        lda #ACT_PAL_HURT
+        lda #ACT_PAL_BLINK
         jmp act_set_pal
 @out:
-        lda #ACT_PAL_DOWN                ; 猶予切れ。点滅を止めて「もう終わった」を示す
+        lda #ACT_PAL_OUT                 ; 猶予切れ。点滅を止めて「もう終わった」を示す
         jmp act_set_pal
 @down:
         lda act_timer, x                 ; 残り猶予が少ないほど速く点滅する
@@ -490,12 +520,38 @@ act_player_failed: .res 1
         lda #ACT_BLINK_FAST
 @blink:
         and frame_counter
-        beq @down_a
-        lda #ACT_PAL_DOWN_ALT
+        beq @base                        ; 点滅の片側は**本来の色**（他の役割の色を借りない）
+        lda #ACT_PAL_BLINK
         jmp act_set_pal
-@down_a:
-        lda #ACT_PAL_DOWN
-        jmp act_set_pal
+.endproc
+
+; X = エンティティ番号。いまの状態に対応する姿勢を engine に渡す。X は保存して返る。
+;
+; 待機状態（ACT_ST_IDLE）だけは、表の1項では足りない。立っているのか歩いているのかは
+; 状態ではなく「今フレーム動いたか」（ACT_F_MOVED）で決まるためである。
+; 印を下ろすのは呼び出し元（act_present）。**読んだ後に下ろす**（理由はそちらに書いた）。
+; 歩きの絵は1枚しか無いので、立ちと交互に出して2コマの歩行にしている（ACT_WALK_ANIM）。
+.proc act_pose_for_state
+        ldy ent_state, x
+        cpy #ACT_ST_COUNT
+        bcs @done                        ; 語彙の外。表の外を引かないための保険
+        lda act_pose_by_state, y
+        cpy #ACT_ST_IDLE
+        bne @set
+        lda act_flags, x
+        and #ACT_F_MOVED
+        beq @stand
+        lda frame_counter
+        and #ACT_WALK_ANIM
+        beq @stand
+        lda #ACT_POSE_MOVE
+        jmp @set
+@stand:
+        lda act_pose_by_state + ACT_ST_IDLE
+@set:
+        jmp ent_set_pose
+@done:
+        rts
 .endproc
 
 ; X = エンティティ番号, A = パレット番号(0..3)。本来の属性のパレットだけ差し替える。

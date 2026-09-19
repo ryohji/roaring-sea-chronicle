@@ -2,14 +2,21 @@
 ;
 ; 責務:
 ;   * 攻撃矩形の組み立て（向き × 段数の表から。数値は action_params.s）
-;   * **レーン間攻撃の可否**（ACT_LANE_REACH。P1 の受入条件）
+;   * **奥行き方向の攻撃の可否**（Y許容幅 act_depth_tol。ADR-0009。P1 の受入条件）
 ;   * 命中時のヒットストップ・ノックバック・無敵の付与
+;   * **攻撃の届く範囲と当たった位置を画面に出す**（斬り／衝撃の効果スプライト）
 ;
-; engine の当たり判定プリミティブ（rect_overlap / lane_distance）を**使う側**である。
-; 判定ルール（どのレーンまで届くか・何段目が何ドットか）は action の持ち分であり、
-; engine には持ち込まない（src/engine/collide.s の冒頭コメント）。
+; engine の当たり判定プリミティブ（rect_overlap / depth_distance）と、効果スプライトの
+; 枠（fx_spawn）を**使う側**である。判定ルール（Y何ドットまで届くか・何段目が何ドットか）と
+; 「いつ何を出すか」は action の持ち分であり、engine には持ち込まない
+;（src/engine/collide.s / src/engine/fx.s の冒頭コメント）。
 ;
-; rect_overlap は A・tmp0・tmp1 を壊す。lane_distance は tmp0 を壊す。
+; **レーンは ADR-0009 で廃止した。** 奥行きは連続なので、
+; 「同じレーンか」ではなく「足元Yがどれだけ近いか」で判定する。
+; レーン補間中の救済（出発レーンにも目標レーンにも居るとみなす分岐）は、
+; 補間という状態そのものが無くなったので**丸ごと消えた**。
+;
+; rect_overlap は A・tmp0・tmp1 を壊す。depth_distance は tmp0 を壊す。
 ; したがって走査の途中状態は tmp に置かず、actor.s の BSS に置く。
 .include "constants.inc"
 .include "zeropage.inc"
@@ -19,15 +26,15 @@
 .export act_attack_step, act_start_attack, act_damage
 
 .import ent_active, ent_state, ent_body, ent_y
-.import ent_x_lo, ent_x_hi, ent_lane, ent_lane_from, ent_lane_step
-.import rect_overlap, lane_distance
+.import ent_x_lo, ent_x_hi
+.import rect_overlap, depth_distance, fx_spawn
 .import act_hp, act_timer, act_step, act_face, act_invuln, act_hitstop
 .import act_kb, act_flags
 .import act_px, act_t0, act_atk_ent, act_scan_end
 .import act_kb_dir, act_kb_amt, act_dmg_amt
-.import act_ld0, act_ld1, act_la0, act_la1
+.import act_dy, act_tol
 .import act_enter_down
-.import act_hurt_w, act_hurt_h
+.import act_hurt_w, act_hurt_h, act_depth_tol
 .import atk_startup, atk_active, atk_recover
 .import atk_reach, atk_w, atk_h, atk_dmg, atk_kb
 
@@ -94,7 +101,12 @@
         lda #0
         sta act_flags, x
         lda atk_active, y
-        jmp act_set_phase
+        jsr act_set_phase
+.if ::ACT_SHOW_SWIPE
+        jmp act_spawn_swipe              ; 判定が出た瞬間に、その位置へ斬りを出す
+.else
+        rts
+.endif
 @to_recover:
         lda #ACT_ST_ATK_RECOVER
         sta ent_state, x
@@ -124,7 +136,7 @@
         bcs @next                        ; ダウン中・猶予切れには当たらない
         lda act_invuln, x
         bne @next                        ; 無敵時間中
-        jsr act_lane_ok                  ; レーンを先に見る（矩形より安い）
+        jsr act_depth_ok                 ; 奥行きを先に見る（矩形より安い）
         bcc @next
         jsr act_build_hurt_rect
         jsr rect_overlap                 ; engine のプリミティブ（辺が接するだけは非重なり）
@@ -155,55 +167,37 @@
         rts
 .endproc
 
-; **レーン間攻撃の可否**。X = 防御側, act_atk_ent = 攻撃側。
+; **奥行き方向の攻撃の可否**（ADR-0009）。X = 防御側, act_atk_ent = 攻撃側。
 ;   出力: キャリーセット = 届く / キャリークリア = 届かない
 ;
-; ACT_LANE_REACH（action_params.inc）が 0 なら同一レーンのみ、1 なら隣接レーンまで。
-; レーン補間中（ent_lane_step != 0）は「出発レーンにも目標レーンにも居る」とみなす。
-; そうしないと、レーンを移りながらの攻撃が LANE_MOVE_FRAMES のあいだ必ず空振りになる。
-.proc act_lane_ok
-        lda ent_lane, x
-        sta act_ld0
-        sta act_ld1
-        lda ent_lane_step, x
-        beq @attacker
-        lda ent_lane_from, x
-        sta act_ld1
-@attacker:
+; 判定は「足元Yの差が許容幅以内か」だけである。レーン番号の一致ではない。
+; 許容幅は体格型ごとの act_depth_tol（= 絵の縦サイズの約1/3。action_params.s）から引く。
+;
+; 攻撃側と被弾側で体格が違うときは**両者の平均**を採る（ACT_DEPTH_TOL_PAIR = 0）。
+; 被弾側だけで決めると「大きい相手には広く、小さい相手には狭い」が極端になり、
+; 攻撃側だけで決めると相手の大きさが判定に出ない。平均はその中間である。
+;
+; depth_distance は tmp0 を壊し、X は壊さない（エンティティ番号を持ったまま呼べる）。
+.proc act_depth_ok
         ldy act_atk_ent
-        lda ent_lane, y
-        sta act_la0
-        sta act_la1
-        lda ent_lane_step, y
-        beq @test
-        lda ent_lane_from, y
-        sta act_la1
-@test:
-        lda act_ld0
-        ldy act_la0
-        jsr @dist
-        bcc @ok
-        lda act_ld0
-        ldy act_la1
-        jsr @dist
-        bcc @ok
-        lda act_ld1
-        ldy act_la0
-        jsr @dist
-        bcc @ok
-        lda act_ld1
-        ldy act_la1
-        jsr @dist
-        bcc @ok
+        lda ent_y, y
+        tay                              ; Y = 攻撃側の足元Y（**値**であって番号ではない）
+        lda ent_y, x                     ; A = 被弾側の足元Y
+        jsr depth_distance               ; A = |足元Yの差|
+        sta act_dy
+        ldy ent_body, x                  ; 被弾側の許容幅
+        lda act_depth_tol, y
+.if ::ACT_DEPTH_TOL_PAIR = 0
+        sta act_tol
+        ldy act_atk_ent                  ; 攻撃側の許容幅
+        lda ent_body, y
+        tay
+        lda act_depth_tol, y
         clc
-        rts
-@ok:
-        sec
-        rts
-; A = レーン, Y = レーン → キャリークリアなら届く距離
-@dist:
-        jsr lane_distance                ; engine のプリミティブ（X は壊さない）
-        cmp #ACT_LANE_REACH + 1
+        adc act_tol
+        lsr a                            ; 両者の平均
+.endif
+        cmp act_dy                       ; 許容幅 >= 差 なら キャリーセット = 届く
         rts
 .endproc
 
@@ -279,6 +273,9 @@
 
 ; X = 被弾側。攻撃側（act_atk_ent）の段の値で殴る。
 .proc act_hit
+.if ::ACT_SHOW_IMPACT
+        jsr act_spawn_impact             ; 当たった位置を画面に出す（距離感の手がかり）
+.endif
         ldy act_atk_ent
         lda act_flags, y
         ora #ACT_F_HIT                   ; この振りはもう当たった
@@ -353,3 +350,100 @@
         sta act_step, x
         rts
 .endproc
+
+; ==========================================================================
+; 効果スプライト — **攻撃の届く範囲を画面に出す**
+; ==========================================================================
+; P1 の受入で主が指摘した「攻撃の距離感が掴めません」への直接の対策である。
+; 当たり判定を一切描いていなかったので、どこまで届くのかが画面から分からなかった。
+;
+; 出すのは2つだけ。
+;   斬り（SPR_TILE_SWIPE）  … 判定が出ている間、**攻撃矩形の中心**に出す。届く範囲の提示
+;   衝撃（SPR_TILE_IMPACT） … 命中した瞬間、**相手の体の中心**に出す。当たった位置の提示
+;
+; 枠と寿命は engine（src/engine/fx.s）が持つ。**寿命が尽きたら engine が消すので
+; 後始末は要らない。**枠が空いていなければ黙って出ない（効果は消えてよい）。
+; 出す／出さないは action_params.inc の ACT_SHOW_SWIPE / ACT_SHOW_IMPACT で切れる。
+
+.if ::ACT_SHOW_SWIPE
+; X = 攻撃側。攻撃矩形の中心に斬りを出す。X は保存して返る。
+;
+; 寿命を「持続フレーム数 + 1」にしてあるのは、判定が出た**フレームの終わり**にここへ
+; 来るのに対し、当たり判定の走査は次のフレームから始まるためである。
+; +1 しないと、最後の走査フレームだけ絵が消えている状態になる。
+.proc act_spawn_swipe
+        jsr act_build_attack_rect        ; 判定と同じ手続きで組む（絵と判定がずれない）
+        ; --- X = 矩形の中心。8 ドット幅の絵の中心を矩形の中心に合わせる ---
+        lda rect_a + RECT_W
+        lsr a
+        sec
+        sbc #SPRITE_W / 2
+        bcs :+
+        lda #0                           ; 矩形が絵より狭いとき
+:       clc
+        adc rect_a + RECT_X_LO
+        sta fx_arg_x_lo
+        lda rect_a + RECT_X_HI
+        adc #0
+        sta fx_arg_x_hi
+        ; --- Y = 矩形の縦の中心。fx は足元Yで置くので絵の高さの半分を足す ---
+        lda rect_a + RECT_H
+        lsr a
+        sta act_t0
+        lda ent_y, x
+        sec
+        sbc act_t0
+        clc
+        adc #SPRITE_H / 2
+        sta fx_arg_y
+        lda #SPR_TILE_SWIPE
+        sta fx_arg_tile
+        lda #SPR_PAL_EFFECT
+        ldy act_face, x
+        beq :+
+        ora #ENT_ATTR_HFLIP              ; 左向きの攻撃は絵も裏返す
+:       sta fx_arg_attr
+        ldy act_step, x
+        dey
+        lda atk_active, y
+        clc
+        adc #1
+        sta fx_arg_life
+        jmp fx_spawn
+.endproc
+.endif
+
+.if ::ACT_SHOW_IMPACT
+; X = 被弾側。相手の体の中心に衝撃を出す。X は保存して返る。
+.proc act_spawn_impact
+        ldy ent_body, x
+        lda act_hurt_w, y
+        lsr a
+        sec
+        sbc #SPRITE_W / 2
+        bcs :+
+        lda #0
+:       clc
+        adc ent_x_lo, x
+        sta fx_arg_x_lo
+        lda ent_x_hi, x
+        adc #0
+        sta fx_arg_x_hi
+        lda act_hurt_h, y
+        lsr a
+        sta act_t0
+        lda ent_y, x
+        sec
+        sbc act_t0
+        clc
+        adc #SPRITE_H / 2
+        sta fx_arg_y
+        lda #SPR_TILE_IMPACT
+        sta fx_arg_tile
+        lda #SPR_PAL_EFFECT
+        sta fx_arg_attr
+        lda #ACT_FX_IMPACT_LIFE
+        sta fx_arg_life
+        jmp fx_spawn
+.endproc
+.endif

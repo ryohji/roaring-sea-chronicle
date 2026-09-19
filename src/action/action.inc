@@ -30,6 +30,10 @@ ACT_ROLE_ALLY   = 1
 ACT_ROLE_ENEMY  = 2
 
 ; --- act_flags のビット ---
-ACT_F_HIT = %10000000    ; この振りで既に当てた（同じ振りで2度当たらない）。bmi で見る
+ACT_F_HIT   = %10000000  ; この振りで既に当てた（同じ振りで2度当たらない）。bmi で見る
+; 今フレーム動いた（歩きの絵にするため）。act_update_actor が毎フレーム下ろし、
+; 移動した側（act_move_left / act_move_right / act_player_depth）が立てる。
+; **状態ではない。**「1フレームの事実」であり、次のフレームには持ち越さない。
+ACT_F_MOVED = %01000000
 
 .endif

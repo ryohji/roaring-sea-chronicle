@@ -3,7 +3,12 @@
 ; 責務:
 ;   * 入力ゲート（猶予中は実効入力をゼロにする。ADR-0006）
 ;   * 先行入力バッファ（ヒットストップ中も**捨てない**。規約）
-;   * 移動・レーン移動・攻撃の開始とコンボの継続
+;   * 移動・奥行き移動・攻撃の開始とコンボの継続
+;
+; **レーンは ADR-0009 で廃止した。** 奥行きは連続で、上下入力は足元Y（ent_y）を
+; そのまま動かす。補間という状態を持たないので「移動中は入力を捨てる」区間も無い。
+; 縦も横も、押したフレームに押したぶんだけ動く**同じ性質の操作**である
+;（P1 で主が指摘した「縦方向にだけ制限がかかる理不尽」の除去）。
 ;
 ; 入力に関する規約が2つあり、**扱いが逆である**ことに注意:
 ;   ヒットストップ中 … 入力を捨てない（先行入力を保持する）
@@ -23,12 +28,14 @@
 .export act_input_gate, act_input_buffer, act_input_drop
 .export action_update_player
 
-.import ent_state, ent_lane, ent_lane_step, ent_lane_move
-.import act_step, act_face, act_hitstop, act_sub, act_px, act_t0
+.import ent_state, ent_depth_move
+.import act_step, act_face, act_hitstop, act_sub, act_dsub, act_px, act_t0
+.import act_flags
 .import act_update_actor, act_move_left, act_move_right
 .import act_start_attack
 
 .assert ACT_MOVE_SPEED <= 240, error, "ACT_MOVE_SPEED が大きすぎる（小数部の累算が8bitで巻き取る）"
+.assert ACT_DEPTH_SPEED <= 240, error, "ACT_DEPTH_SPEED が大きすぎる（小数部の累算が8bitで巻き取る）"
 
 .segment "BSS"
 
@@ -48,7 +55,7 @@ act_buf_atk:    .res 1       ; 攻撃の先行入力の残りフレーム
         lda ent_state, x
         cmp #ACT_ST_DOWN
         bcc @alive
-        ; 猶予中（ダウン中）と猶予切れ。移動・レーン移動・攻撃・ガードのいずれも受け付けず、
+        ; 猶予中（ダウン中）と猶予切れ。移動・奥行き移動・攻撃・ガードのいずれも受け付けず、
         ; 先行入力も残さない（ADR-0006）。ゲームの中断のようなメタ操作は
         ; ここを通らない別経路で拾うこと（ポーズ仕様が決まるまでは未実装）。
         jmp act_input_drop
@@ -121,7 +128,7 @@ act_buf_atk:    .res 1       ; 攻撃の先行入力の残りフレーム
         jmp act_start_attack             ; 攻撃を始めたフレームは動かない
 @move:
         jsr act_player_move
-        jmp act_player_lane
+        jmp act_player_depth
 
         ; 硬直中。この相が次の段の受付時間である（長さは atk_recover）
 @combo:
@@ -177,28 +184,49 @@ act_buf_atk:    .res 1       ; 攻撃の先行入力の残りフレーム
         rts
 .endproc
 
-; X = ENT_PLAYER。上下でレーンを1つ移す。補間は engine（lane.s）が持つ。
-.proc act_player_lane
-        lda ent_lane_step, x
-        bne @done                        ; 補間中は次のレーン移動を受け付けない
-        lda act_pad_new
+; X = ENT_PLAYER。上下で奥行き（足元Y）を動かす。ADR-0009。
+;
+; 横移動（act_player_move）と**まったく同じ形**である。違うのは速さ
+;（ACT_DEPTH_SPEED）と、クランプを engine の ent_depth_move が持つことだけ。
+; レーン時代にあった3つの制限（4段階の量子化・8フレームの補間・補間中の入力破棄）は
+; いずれも無い。押しっぱなしで動き続け、離せばその場で止まる。
+;
+; 上下同時押しは上（奥）を採る。左右同時押しで左を採るのと同じ扱いである。
+.proc act_player_depth
+        lda act_pad
+        and #(PAD_UP | PAD_DOWN)
+        bne @moving
+        lda #0
+        sta act_dsub, x                  ; 止まったら小数部を捨てる（歩き出しを揃える）
+        rts
+@moving:
+        lda act_dsub, x
+        clc
+        adc #ACT_DEPTH_SPEED
+        pha
+        and #$0F
+        sta act_dsub, x
+        pla
+        lsr a
+        lsr a
+        lsr a
+        lsr a
+        beq @done                        ; 今フレームは1ドットに満たない
+        sta act_px                       ; 今フレームの整数ドット数（横移動はもう済んでいる）
+        lda act_flags, x
+        ora #ACT_F_MOVED                 ; 歩きの絵にする（姿勢を選ぶのは actor.s）
+        sta act_flags, x
+        lda act_pad
         and #PAD_UP
-        beq @down_btn
-        lda ent_lane, x
-        beq @done                        ; レーン0 より奥は無い
-        sec
-        sbc #1
-        jmp ent_lane_move
-@down_btn:
-        lda act_pad_new
-        and #PAD_DOWN
-        beq @done
-        lda ent_lane, x
-        cmp #LANE_LAST
-        bcs @done                        ; 最も手前のレーンより先は無い
+        beq @near
+        lda act_px                       ; 奥へ = 足元Yを小さく = 負の移動量
+        eor #$FF
         clc
         adc #1
-        jmp ent_lane_move
+        jmp ent_depth_move               ; 歩ける帯のクランプは engine が持つ
+@near:
+        lda act_px                       ; 手前へ = 足元Yを大きく
+        jmp ent_depth_move
 @done:
         rts
 .endproc

@@ -185,10 +185,6 @@ SPR_CLASS_COUNT    = 5
 ; 帯の上下限は定数ではなく変数である（src/engine/depth.s の depth_y_min / depth_y_max）。
 ; 既定値の定義は ENT_Y_TO_OAM の直後（DEPTH_Y_MIN_DEFAULT / DEPTH_Y_MAX_DEFAULT）にある。
 ;
-; **暫定**: LANE_LAST だけは、まだ src/action/player.s が参照しているので残してある。
-; レーン番号は常に 0（src/engine/lane_compat.s）なので、上限も 0 である。
-; action-dev が移行したら、この1行と src/engine/lane_compat.s を消すこと。
-LANE_LAST = 0
 
 ; ---- エンティティテーブル ----
 ; Structure of Arrays（属性ごとに1配列）。実体と各配列のラベルは src/engine/entity.s。

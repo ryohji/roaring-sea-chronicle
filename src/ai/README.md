@@ -16,7 +16,7 @@
 |---|---|
 | `data/ai_params.tsv` | **パラメータ表の正本。** 型を足す = ここに行を足す |
 | `ai_params.s` | 上の写し（変換器が入るまでの暫定。列ごとに1本の `.byte` 配列） |
-| `ai_params.inc` | **型に属さない**調整値（専有距離・分散幅・思考の予算） |
+| `ai_params.inc` | **型に属さない**調整値（専有距離・重なり幅・分散幅・不感帯・思考の予算） |
 | `ai.inc` | 語彙（プロファイル行の番号・目標ID・フラグ）。数値は置かない |
 | `ai.s` | 意思決定ループ**1本**。状況評価 → 目標選択 → 行動 |
 
@@ -30,7 +30,7 @@ ai_update  （毎フレーム1回）
   ├ ai_sense        場の状況を1回まとめる（操作キャラが猶予中か = ADR-0006 の口）
   ├ ai_think_slice  1フレームに AI_THINK_PER_FRAME 体だけ考え直す（分散実行）
   │   └ ai_think_for
-  │        ├ ai_select_target  重みつき距離（横距離 + レーン差×8）で最寄りを選ぶ
+  │        ├ ai_select_target  重みつき距離（横距離 + 足元Yの差。どちらもドット）で最寄りを選ぶ
   │        └ ai_plan           目標（待機/復帰/交戦）と立ち位置（側・間合い）を決める
   │             └ ai_spread    同じ標的に同じ側から寄る者どうしをずらす
   └ 自律枠の生存者ぶん ai_act_one（軽い）
@@ -38,9 +38,23 @@ ai_update  （毎フレーム1回）
        │    ├ ai_clear_player_zone  立ち位置を操作キャラの専有距離の外へ出す
        │    └ ai_avoid_allies       立ち位置を仲間から AI_SPREAD 以上離す
        │                            （押し出しで潰れた分散をここで取り戻す）
-       ├ ai_lane_follow    標的のレーンへ寄る
-       └ ai_try_attack     間合いに入っていれば act_start_attack（action 側が全部やる）
+       │                            どちらも「足元Yが AI_OVERLAP_Y 未満＝絵が縦に重なる」ときだけ効く
+       ├ ai_depth_follow   標的の足元Yへ連続に寄る（AI_DEADBAND_Y まで。depth_spd の速さで）
+       └ ai_try_attack     奥行きを合わせ切っていて間合いにも入っていれば act_start_attack
 ```
+
+## レーン廃止（ADR-0009）で何がどう変わったか
+
+| 旧 | 新 |
+|---|---|
+| `ai_lane_follow`（隣のレーンへ1つ移る / `lane_hold` フレーム待つ） | `ai_depth_follow`（標的の足元Yへ連続に寄る / `depth_spd` の速さ） |
+| 「同じレーンか」（`ent_lane` の一致） | 「足元Yが `AI_OVERLAP_Y` 未満か」（絵が縦に重なるか） |
+| 標的選びの重み `レーン差 × AI_LANE_COST(8)` | 足元Yの差の絶対値を**そのまま**（ドット単位で8倍すると横距離を食い潰す） |
+| 「レーン移動中は振らない」（`ent_lane_step`） | **条件ごと消えた**（補間という状態が無い） |
+| `ai_lturn`（次に移れるまでの待ち） | `ai_ysub`（奥行き移動の 1/16 ドット端数） |
+
+**当たり判定の Y許容幅は action-dev の持ち分**であり、AI は知らない（ADR-0009）。
+`ai_try_attack` が見ているのは **AI 自身の立ち位置の不感帯**（`AI_DEADBAND_Y`）である。
 
 **ダメージ・ヒットストップ・ノックバック・ダウンは `src/action/` の持ち分**であり、
 ここには書かない。敵の攻撃も `act_start_attack` → `act_hit_scan` → `act_damage` を通る。
@@ -52,7 +66,8 @@ ai_update  （毎フレーム1回）
 1. `.import ai_init, ai_update` を足す。
 2. `reset_handler` の `jsr action_init` の直後に `jsr ai_init` を足す
    （エンティティを配置し終えた後であること）。
-3. `main_loop` の `jsr action_update` と `jsr lane_update_all` の間に `jsr ai_update` を足す。
+3. `main_loop` の `jsr action_update` の後に `jsr ai_update` を足す
+   （レーンの補間が無くなったので、これ以外の順序の制約はもう無い）。
 4. 配置するエンティティに `ent_ai`（`data/ai_params.tsv` の id 列）を詰める。
    詰め忘れても `ai_init` が立場ごとの既定値で埋めるが、詰めるのが正しい。
 
@@ -78,8 +93,19 @@ Python 6502 ハーネスで `ai_update` の入口から出口までを計測し�
 | 仲間2＋敵6（満員）・無操作 | 2799 | 5354 |
 | 仲間2＋敵6（満員）・右へ歩き続ける | 3960 | 6222 |
 
-満員でも1フレーム全体（`action_update` + `ai_update` + `lane_update_all` +
-`cam_update` + `oam_build`）の中央値は 9660 サイクルで、予算の約 1/3 である。
+ADR-0009（レーン廃止）後に取り直した値（満員・右へ歩き続ける、400 フレーム）。
+比較のため、同じ計測を廃止前のコードでも行った。
+
+| | 中央値 | 最大 |
+|---|---:|---:|
+| 廃止前（`ai_lane_follow` がレーン互換の暫定で素通りしていた） | 3704 | 6211 |
+| 廃止後（`ai_depth_follow` が毎フレーム実際に働く） | 4053 | 6754 |
+
+増えた約 350 サイクル（+9%）は、**奥行き追従が実際に動くようになったぶん**である
+（暫定の `lane_compat.s` の下では全員が同じレーンに見えたので、追従は2命令で素通りしていた）。
+
+満員でも1フレーム全体（`action_update` + `ai_update` + `cam_update` + `oam_build`）の
+中央値は 1万サイクル前後で、予算（29780）の約 1/3 である。
 
 費用を下げる手は、増えた順に:
 `AI_THINK_PER_FRAME` を減らす / `AI_RETHINK_PER_FRAME` を減らす /
