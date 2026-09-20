@@ -34,7 +34,8 @@
 
 .export ai_init, ai_init_entity, ai_update
 .export ai_goal, ai_target, ai_gap, ai_flags, ai_timer
-.export ai_sit, ai_cursor
+.export ai_react, ai_woff, ai_woffy, ai_wtim
+.export ai_sit, ai_cursor, ai_rng
 
 .import ent_active, ent_x_lo, ent_x_hi, ent_y, ent_state, ent_ai
 .import ent_depth_move, depth_distance
@@ -42,6 +43,7 @@
 .import act_move_left, act_move_right, act_start_attack
 .import ai_p_speed, ai_p_hold_x, ai_p_reach_x, ai_p_aggr_x
 .import ai_p_follow_x, ai_p_leash_x, ai_p_atk_gap, ai_p_depth_spd
+.import ai_p_hate, ai_p_react, ai_p_wander, ai_p_dwell
 .import ai_default_profile
 
 ; 自律行動の対象になる区画（仲間 + 敵）。操作キャラ(0)と共用枠は含まない。
@@ -52,6 +54,10 @@ AI_END   = ENT_FREE_FIRST
 ; AI_DIR_NEAREST = 向きにこだわらない（いま立ち位置がある側＝近い方の外へ出す）。
 ; 調整値ではなく符号なので ai_params.inc ではなくここに置く。
 AI_DIR_NEAREST = $FF
+
+; 揺らぎを引く 8bit LFSR の種。**0 以外の固定値**であること
+; （0 から出られない／種が動くと再現しなくなる）。値そのものに意味は無い。
+AI_RNG_SEED = $A7
 
 .segment "BSS"
 
@@ -64,10 +70,18 @@ ai_timer:   .res MAX_ENTITIES   ; 次に振れるまでのフレーム数
 ai_sub:     .res MAX_ENTITIES   ; 横移動の小数部（1/16 ドット）
 ai_ysub:    .res MAX_ENTITIES   ; 奥行き移動の小数部（1/16 ドット）
 
+; --- 棒立ちにしないための3つ組（主の指摘。ai_params.inc §4-b）---
+; **どれも型ごとの分岐ではない。**値は TSV の react / wander / dwell 列から来る。
+ai_react:   .res MAX_ENTITIES   ; 歩き出すまでに残っている遅れ（フレーム）
+ai_woff:    .res MAX_ENTITIES   ; いま狙っている立ち位置のずれ（**符号つき**ドット・横）
+ai_woffy:   .res MAX_ENTITIES   ; 同（奥行き）。横の半分。**交戦中は 0**（ai_plan）
+ai_wtim:    .res MAX_ENTITIES   ; 次に ai_woff を引き直すまでのフレーム数
+
 ; --- 場の状態 ---
 ai_sit:     .res 1              ; AI_SIT_*（状況評価の結果）
 ai_cursor:  .res 1              ; 次に考え直すエンティティ番号（思考の分散実行）
 ai_rethink: .res 1              ; 今フレームに残っている「臨時の考え直し」の回数
+ai_rng:     .res 1              ; 揺らぎを引く手（8bit LFSR。種は固定＝再現する）
 
 ; --- 作業変数（engine の呼び出しをまたぐので tmp には置けない）---
 ai_prof:    .res 1              ; いま処理している者のプロファイル行
@@ -86,6 +100,8 @@ ai_bestsc:  .res 1              ; 同、その重みつき距離
 ai_px:      .res 1              ; 今フレームに進めるドット数（横・奥行きで共用）
 ai_ydif:    .res 1              ; 標的との奥行きの隔たり
                                 ;   （ai_depth_follow が測り、ai_try_attack が使い回す）
+ai_urgent:  .res 1              ; 今この瞬間、**自分の体が**操作キャラの専有距離の中に居るか
+                                ;   （1 なら歩き出しの遅れを飛ばして退く。ai_move_to_post）
 
 .segment "CODE"
 
@@ -100,6 +116,10 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         sta ai_sit
         lda #AI_FIRST
         sta ai_cursor
+        ; 揺らぎを引く手の種。**固定値である。**同じ操作をすれば必ず同じ挙動になる
+        ; （0 を入れてはならない。LFSR は 0 から出られない）。
+        lda #AI_RNG_SEED
+        sta ai_rng
         ldx #MAX_ENTITIES - 1
 @clear:
         jsr ai_clear_one
@@ -145,6 +165,10 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         sta ai_timer, x
         sta ai_sub, x
         sta ai_ysub, x
+        sta ai_react, x
+        sta ai_woff, x
+        sta ai_woffy, x
+        sta ai_wtim, x           ; 0 = 最初に動くときその場で引き直す
         rts
 .endproc
 
@@ -196,7 +220,16 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
 ; 失敗確定後に共有アイテムを1個捨てる経路ができる（次のシナリオに響く）。
 ; 猶予切れ用のビットは足していない。読む者がまだ居ないビットを先に作ると、
 ; 「立っているが誰も見ない」状態が P2 まで検証されないまま残るからである。
+;
+; **揺らぎを引く手をここで毎フレーム1歩進める。**引く瞬間にだけ進めると、
+; 8bit LFSR は1歩でビットが1つずれるだけなので、**続けて引いた目が強く相関する**。
+; 実測: 引く瞬間だけ進めた版では「真ん中」が4回続き、仲間が 430 フレーム（7.2 秒）
+; 固まったまま立っていた（＝主の言う棒立ちが直っていなかった）。
+; 毎フレーム進めれば、引き直しの間隔（80 フレーム前後）ぶん離れた目を引くので相関が切れる。
+; 種は固定のままなので**再現性は失われない**（同じ操作なら必ず同じ並びになる）。
+; 費用は1フレーム 10 サイクル強である。
 .proc ai_sense
+        jsr ai_rand              ; 揺らぎを引く手を1歩進める（下の注記）
         lda #0
         sta ai_sit
         ldx #ENT_PLAYER
@@ -271,6 +304,15 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
 ; 奥行きの差はドットでそのまま測れるので、重み（かつての AI_LANE_COST = 8 倍）は要らない。
 ; **ドット単位で 8 倍すると横距離を食い潰す**（レーン差は 0..3 だったが、
 ; 足元Yの差は歩ける帯の高さぶん＝数十ドットまで出る）。1ドットは1ドットとして足す。
+;
+; **ヘイト**（誰を狙うかの重み）は、その「遠さ」から (hate - AI_HATE_MID) ドットを引く形で
+; 効かせる（ai_apply_hate）。ヘイトの高い者は**実際より近くに居る**ものとして測られるので、
+; 距離と同じ物差しの上で一貫して比較できる。別の物差し（倍率・優先順位のテーブル）を
+; 足さないのは、攻撃性 aggr_x が距離の物差しで書かれているからである。
+; 128 が中立なので、**全行 128 のあいだは何も変わらない**（P1 がそれである）。
+;
+; 相手の側のプロファイルを引くので、走査のたびに1回だけ ent_ai を読む。
+; 範囲外の ent_ai は 0 行目に倒す（ai_load_profile と同じ安全柵。表の外を引かせない）。
 .proc ai_select_target
         lda #AI_NONE
         sta ai_best
@@ -310,7 +352,31 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         adc ai_dist
         bcc :+
         lda #$FF                 ; 頭打ち
-:       cmp ai_bestsc
+        ; --- ヘイト（狙われやすさ）。ここは**走査の内側**なので畳み込んである ---
+        ; 遠さ' = 遠さ - (hate - AI_HATE_MID)。詳しくは下の注記を見よ。
+:       sta ai_t3
+        ldy ai_cand
+        lda ent_ai, y
+        cmp #AI_PROFILE_COUNT
+        bcc :+
+        lda #0                   ; 詰め忘れ・未初期化は 0 行目に倒す（表の外を引かせない）
+:       tay
+        lda #AI_HATE_MID
+        sec
+        sbc ai_p_hate, y
+        bcs @repel               ; hate <= 128 … 遠く見せる（足す）
+        clc                      ; hate >  128 … 近く見せる（引く。8bit では足し算になる）
+        adc ai_t3
+        bcs @scored              ; 256 を跨いだ＝引き算の答がそのまま A に居る
+        lda #0                   ; 跨がない＝負。0 まで（いちばん近い）
+        beq @scored              ; 常に成立
+@repel:
+        clc
+        adc ai_t3
+        bcc @scored
+        lda #$FF                 ; 255 で頭打ち（これ以上遠くはひとまとめでよい）
+@scored:
+        cmp ai_bestsc
         bcs @next
         sta ai_bestsc
         lda ai_cand
@@ -330,6 +396,24 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
 @keep:
         rts
 .endproc
+
+; --------------------------------------------------------------------------
+; ヘイト（狙われやすさ）の算数 —— 上の走査に畳み込んである実体の説明
+; --------------------------------------------------------------------------
+;   遠さ' = 遠さ - (hate - AI_HATE_MID)
+;
+; hate = AI_HATE_MID(128) なら素通りである（**P1 は全行これなので挙動は何も変わらない**）。
+; 大きいほど近くに見える＝狙われる（タンク）。小さいほど遠くに見える＝狙われにくい（遠隔）。
+;
+; 8bit のまま扱うために、まず d = (AI_HATE_MID - hate) を 8bit で作る:
+;   hate <= 128 … d は 0..128 の**正**。遠さ + d（あふれたら 255 で頭打ち）
+;   hate >  128 … d は 256-(hate-128)。遠さ + d は 256 を跨いだときだけ正しい答になる
+;                  （跨がなければ答は負なので 0 に落とす）
+; どちらも「遠さ + d」1回で済む。場合分けは sbc の桁借りがそのまま教えてくれる。
+;
+; **独立した手続きにして jsr で呼んではならない。**ここは候補の数だけ回る走査の
+; 内側であり、jsr/rts の 12 サイクルが満員（候補6体 × 思考2回）で 144 サイクルになる。
+; 実測でそれが1フレームの費用にそのまま乗った。
 
 ; ==========================================================================
 ; 目標選択 2 — 目標と立ち位置を決める
@@ -367,6 +451,7 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         ldy ai_prof
         lda ai_p_hold_x, y       ; **好む間合い**
         sta ai_gap, x
+        jsr ai_clear_wander      ; **構えている間は揺らがない**（下の注記）
         jmp ai_spread
 
 @no_target:
@@ -394,7 +479,199 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         ldy ai_prof
         lda ai_p_follow_x, y     ; **プレイヤーへの追従距離**
         sta ai_gap, x
+        jsr ai_set_woffy         ; 狙う相手が居ない。ぴったり並ぶ理由も無い
+        jsr ai_apply_wander      ; **揺らぎ → 分散**の順（下の注記）
         jmp ai_spread
+.endproc
+
+; ==========================================================================
+; 揺らぐのは「構えていないとき」だけである —— 型で分けているのではない
+; ==========================================================================
+; 揺らぎ（ai_woff / ai_woffy）を足すのは AI_GOAL_REGROUP の側だけで、
+; AI_GOAL_ENGAGE では 0 に落とす。**目標で分けているのであって型ではない。**
+;
+; 理由は2つあり、どちらも「揺らぎが型の個性を壊す」という同じ話である:
+;
+;   1. 横（ai_woff）… 間合い hold_x と攻撃に移る閾値 reach_x の隙間は狭い
+;      （万能型で 14 と 20 の 6 ドット）。ここに AI_DEADBAND より広い揺らぎは入らない。
+;      入れると立ち位置が reach_x の外に出て、**構えたまま振らない**時間ができる。
+;      実測: 交戦中の横距離の中央値が 15 → 19 ドット（reach_x = 20）に上がり、
+;      1体倒すのに 717 → 760 フレームかかった。
+;   2. 奥行き（ai_woffy）… 奥行きを合わせ切ったかどうかが**攻撃に移る入口**である
+;      （ai_try_attack）。揺らすと永久に振らない仲間ができる。
+;
+; 揺らぎは「棒立ちに見えないため」のものであり、棒立ちが問題になるのは
+; **狙う相手が居ないとき**である。構えている間は型の間合いどおりに立てばよい。
+;
+; **分散（ai_spread）より前に足すこと。**分散は「同じ所に寄る者どうしを番号順に
+; 引き離す」保証であり、その後に揺らぎを足すと保証を壊す。
+.proc ai_clear_wander
+        lda #0
+        sta ai_woffy, x
+        rts
+.endproc
+
+; ==========================================================================
+; 棒立ちにしない —— 止まる位置を揺らす
+; ==========================================================================
+; X = 自分。決まった間合い（ai_gap）に、いま引いてある揺らぎ（ai_woff）を足す。
+;
+; 主の指摘: 「プレイヤーキャラクターと Y を揃えて等距離を保つという動きが、
+; あまりに機械的 ── プレイヤーから等距離を移動するモノという印象を与えています」。
+; そう見えたのは、**追従距離ちょうどに吸着していた**からである。
+; ここで間合いそのものを数ドット外す。外し方は何秒かに一度しか変わらないので、
+; 画面では「そこまで歩いて、しばらくそこに居た」という一つの意図として読める。
+;
+; 揺らぎは**間合いの側**に足す。実際の歩きの側（ai_move_to_post）に足すと、
+; 毎フレーム目標がぶれて足踏みになる。ここなら目標が静かに数ドット動くだけである。
+;
+; 下限 AI_GAP_MIN で止める。**操作キャラとの間の下限はここではない**
+; （ai_clear_player_zone が立ち位置そのものに対して持っている。壁にならない規則は
+;  揺らぎより後に効くので、内向きの揺らぎが専有距離を食い破ることはない）。
+.proc ai_apply_wander
+        lda ai_woff, x
+        beq @done                ; 揺らぎ無し（wander = 0 の型もここを通る）
+        bmi @inward
+        clc                      ; 外向き
+        adc ai_gap, x
+        bcc @store
+        lda #$FF                 ; 255 で頭打ち
+        bne @store               ; 常に成立
+@inward:
+        clc                      ; 内向き（ai_woff は符号つき。足せばよい）
+        adc ai_gap, x
+        bcc @floor               ; 桁借り = 0 を下回った
+        cmp #AI_GAP_MIN
+        bcs @store
+@floor:
+        lda #AI_GAP_MIN
+@store:
+        sta ai_gap, x
+@done:
+        rts
+.endproc
+
+; X = 自分（ai_prof 済み）。揺らぎの段と、次に引き直すまでの周期を引き直す。
+;
+; **引くのはこの瞬間だけ**である（毎フレームではない）。毎フレーム振ると
+; 落ち着きの無い震えになり、「意図があって歩いた」に見えない（ai_params.inc §4-b）。
+;
+; 段は **-1 / 0 / +1 / +2 の4通り**を等確率で引く。
+; 3通り（-1 / 0 / +1 に 0 を2回割り当てる）にすると、**引き直しの半分が同じ所を指して
+; 一歩も動かない**。引き直しの間隔が 80 フレーム前後なので、それでは
+; 「立ち止まったまま固まっている」時間が平均 2.7 秒になり、棒立ちが直らない。
+; 4通りなら動かないのは 1/4 で、1.8 秒に一度は足が出る。
+; 「ときどき少し向こうまで歩いてから戻る」は +2 段 → 0 段 の並びとして出る。
+;
+; 平均が +0.5 段ぶん外へ寄るので、**その半段ぶんは follow_x / hold_x 側で引いてある**
+; （TSV の follow_x を 30 → 26 にしたのはこのためである。平均の立ち位置は変えていない）。
+;
+; 1段の幅（wander 列）は **AI_DEADBAND より確実に広く**取ること。
+; 同じくらいだと、引き直しても立ち位置の許容誤差に飲まれて一歩も動かない
+; （実測: wander = AI_DEADBAND = 4 のとき、900 フレームで動いたのは 2 フレームだけだった）。
+;
+; 周期は dwell に AI_WANDER_JITTER ぶんの散らしを足す。散らさないと全員が
+; 同じ拍で引き直し、隊列が一斉に動いて**かえって機械的に見える**。
+.proc ai_reroll_wander
+        lda ai_rng               ; 引く手は ai_sense が毎フレーム進めている
+        sta ai_t0                ; 引いた目
+        ldy ai_prof
+        lda ai_p_dwell, y
+        beq @never               ; dwell = 0 … この型は揺らがない
+        sta ai_t1
+        lda ai_p_wander, y
+        sta ai_t2                ; 1段の幅
+        lda ai_t0
+        and #AI_WANDER_JITTER
+        clc
+        adc ai_t1
+        bcc :+
+        lda #$FF                 ; 頭打ち（周期が 255 フレームを超えることはまず無い）
+:       sta ai_wtim, x
+
+        lda ai_t0                ; 段は上の方のビットから取る
+        lsr a                    ;   （下位は周期の散らしに使ったので、同じビットを
+        lsr a                    ;    二度使うと段と周期が連動してしまう）
+        lsr a
+        lsr a
+        lsr a
+        and #3                   ; 0..3
+        tay
+        lda #0
+        sec
+        sbc ai_t2                ; -1 段（= 0 - wander）から始めて、引いた目だけ足す
+@step:
+        cpy #0
+        beq @drawn
+        clc
+        adc ai_t2
+        dey
+        jmp @step
+
+@drawn:
+        ; **前と同じ段を引いたら1段ずらす。**そのまま採ると、引き直したのに
+        ; 一歩も動かない回ができる（4通りなので 1/4）。それが続くと
+        ; 立ち止まったまま何秒も固まり、主の言う棒立ちがそこに戻ってくる。
+        ; ずらせば、引き直しのたびに必ず足が出る＝固まる時間は周期（dwell）で頭打ちになる。
+        ; **間隔と距離は引いた目のままなので、規則正しくは見えない**
+        ; （周期は AI_WANDER_JITTER で散り、動く距離は 1〜3 段ぶんとまちまちになる）。
+        cmp ai_woff, x
+        bne @set
+        sta ai_t1                ; dwell はもう使い終わっているので箱を借りる
+        lda ai_t2
+        asl a                    ; +2 段（段の上端）
+        cmp ai_t1
+        bne @bump
+        lda #0                   ; 上端だった → -1 段（下端）へ回す
+        sec
+        sbc ai_t2
+        jmp @set
+@bump:
+        lda ai_t1
+        clc
+        adc ai_t2                ; 1段外へ
+@set:
+        sta ai_woff, x           ; -1 / 0 / +1 / +2 段
+        rts
+@never:
+        lda #0
+        sta ai_woff, x
+        sta ai_woffy, x
+        lda #$FF                 ; 引き直しに来ない（毎フレーム引き直さない）
+        sta ai_wtim, x
+        rts
+.endproc
+
+; X = 自分。奥行きの揺らぎを横の揺らぎから作る（**列を増やさない**）。
+;
+; 主の指摘のもう半分:「プレイヤーキャラクターと **Y を揃えて** 等距離を保つ」。
+; 横だけ揺らしても、足元Yが操作キャラと1ドット違わず並んでいれば
+; 「等距離を移動するモノ」のままである。奥行きにも同じだけ意図を持たせる。
+;
+; 幅は横の半分にする。奥行きは横より狭く・遅く動くのがベルトスクロールの慣習で、
+; 寄り足の速さ（depth_spd = speed の半分）と同じ関係をここでも保つ。
+; 列を足さないのは、**奥行きの揺らぎを横と独立に回したくなる理由が無い**からである
+; （独立にすると、横が動かない引き直しで奥行きだけ動くという読めない動きが出る）。
+.proc ai_set_woffy
+        lda ai_woff, x
+        cmp #$80                 ; 符号を保ったまま半分にする（算術右シフト）
+        ror a
+        sta ai_woffy, x
+        rts
+.endproc
+
+; 揺らぎを引く手。8bit の最大長 LFSR（x^8+x^4+x^3+x^2+1）。A = 引いた目。
+; **種が固定なので、同じ操作をすれば必ず同じ挙動になる。**
+; 乱数を使ってよいのは「いつ・どれだけ揺れるか」だけである。
+; 陣形の順位（ai_spread / ai_avoid_allies）は番号順のままであり、ここを乱数にすると
+; 再現しない重なりの不具合を作る。
+.proc ai_rand
+        lda ai_rng
+        asl a
+        bcc :+
+        eor #$1D
+:       sta ai_rng
+        rts
 .endproc
 
 ; X = 自分。直前の ai_dist16 の向きから、標的のどちら側に立つかを決める。
@@ -461,8 +738,8 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
 ; 「操作キャラの前に立たない」規則は立ち位置の計算に織り込んである
 ; （ai_move_to_post → ai_clear_player_zone）。目標より先に効く。
 .proc ai_act_one
+        jsr ai_load_profile      ; 時間の経過（揺らぎの引き直し）が表を引くので先に
         jsr ai_tick_timers
-        jsr ai_load_profile
 
         lda act_hitstop, x
         bne @done                ; ヒットストップ中は当人の時間が止まっている
@@ -512,12 +789,20 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         rts
 .endproc
 
-; X = エンティティ番号。時間の経過。動けない状態でも進める。
+; X = エンティティ番号（ai_prof 済み）。時間の経過。動けない状態でも進める。
+;
+; 揺らぎの周期もここで進める。のけぞっていても倒れていても「次はあそこに立とう」
+; という気は進む（動けるようになった瞬間から新しい立ち位置へ歩き出す）。
 .proc ai_tick_timers
         lda ai_timer, x
         beq :+
         dec ai_timer, x
-:       rts
+:       lda ai_wtim, x
+        beq @reroll
+        dec ai_wtim, x
+        rts
+@reroll:
+        jmp ai_reroll_wander
 .endproc
 
 ; ==========================================================================
@@ -547,6 +832,59 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
 :       lda #AI_DIR_NEAREST      ; 向きはこだわらない。近い方の外へ出せばよい
         sta ai_dir
         jmp ai_push_out_of_player
+.endproc
+
+; X = 自分。**立ち位置ではなく自分の体**が操作キャラの専有距離の中に居るなら
+; ai_urgent を立てる（そうでなければ落とす）。X は壊さない。Y と ai_t4 を壊す。
+;
+; 呼ぶのは「歩き出しの遅れがまだ残っている」ときだけである（ai_move_to_post）。
+; 遅れが 0 なら、急ぐも急がないも無い＝この検査に意味が無い。
+; 毎フレーム全員ぶん呼ぶと depth_distance の呼び出しが仲間の数だけ増える
+; （実測で 1フレーム 150 サイクル）。**意味が変わる場面でだけ払う。**
+;
+; なぜ立ち位置（ai_push_out_of_player が見ている方）では足りないか:
+; 操作キャラが歩いてきて仲間に**寄った**とき、仲間の立ち位置はもう専有距離の外に
+; 逃げているが、仲間の体はまだ操作キャラの上に載っている。このとき
+; 「歩き出しの遅れ」で仲間が数フレーム待つと、その間ずっと操作キャラが陰に入る。
+; **退くのを待たせてはならない**（ai-dev の最優先の不具合）。
+; 揺らぎは邪魔をしない範囲でしか入れない、というのがこの分岐の意味である。
+.proc ai_crowds_player
+        lda #0
+        sta ai_urgent
+        cpx #ENT_ENEMY_FIRST
+        bcs @done                ; 敵が操作キャラに近づくのは仕事である
+        ldy #ENT_PLAYER
+        lda ent_active, y
+        beq @done
+        lda ent_y, y
+        tay
+        lda ent_y, x
+        jsr depth_distance
+        cmp #AI_OVERLAP_Y
+        bcs @done                ; 奥行きが離れていれば画面上で重ならない
+        ldy #ENT_PLAYER
+        lda ent_x_lo, x
+        sec
+        sbc ent_x_lo, y
+        sta ai_t4
+        lda ent_x_hi, x
+        sbc ent_x_hi, y
+        beq @right               ; 上位 0 → 自分は操作キャラの右 0..255 ドット
+        cmp #$FF
+        bne @done                ; 256 ドット以上離れている
+        lda ai_t4                ; 上位 $FF → 自分は左。|差| < AI_CLEAR_X は
+        cmp #<(256 - AI_CLEAR_X + 1)     ; 下位が 256-(AI_CLEAR_X-1) 以上と同じこと
+        bcs @crowd
+        rts
+@right:
+        lda ai_t4
+        cmp #AI_CLEAR_X
+        bcs @done
+@crowd:
+        lda #1
+        sta ai_urgent
+@done:
+        rts
 .endproc
 
 ; X = 自分、ai_dir = 出す向き（0:左 / 1:右 / AI_DIR_NEAREST:近い方）。
@@ -799,8 +1137,23 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         bne @walk                ; 256 ドット以上離れている
         lda ai_t0
         cmp #AI_DEADBAND
-        bcc @done                ; もう着いている
+        bcc @arrived             ; もう着いている
 @walk:
+        ; **歩き出しの遅れ**（react）。主の指摘「プレイヤーに少し遅れて歩き出す」。
+        ; 立ち止まっている者は、行くべき所が動いてから react フレーム置いて足を出す。
+        ; 0 にすると操作キャラと同じフレームに歩き出し、連動する影に見える。
+        ; いったん歩き出したら着くまで遅れは効かない（歩きながら足踏みしない）。
+        ;
+        ; **退くときだけは待たない。**操作キャラの陰に入っている間の数フレームは、
+        ; そのまま「壁になっている」時間だからである（ai_crowds_player）。
+        lda ai_react, x
+        beq @go                  ; 遅れは残っていない。急ぐかどうかを調べる意味も無い
+        jsr ai_crowds_player
+        lda ai_urgent
+        bne @go
+        dec ai_react, x
+        rts
+@go:
         jsr ai_step_px
         lda ai_px
         beq @done
@@ -810,6 +1163,10 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
         jmp act_move_right
 @go_left:
         jmp act_move_left
+@arrived:
+        ldy ai_prof              ; 着いた。次に歩き出すときの遅れを積み直す
+        lda ai_p_react, y
+        sta ai_react, x
 @done:
         rts
 .endproc
@@ -841,6 +1198,11 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
 ; **奥行きの寄り足の速さ**（depth_spd）が大きいほど素早く標的の奥行きに並ぶ。
 ; 帯（歩ける範囲）のクランプは engine（ent_depth_move）が持つ。
 ;
+; 狙うのは標的の足元Yそのものではなく、そこに**奥行きの揺らぎ**（ai_woffy）を足した所である。
+; 操作キャラと足元Yが1ドット違わず並び続けるのが「機械的」の正体だった（主の指摘）。
+; ただし ai_woffy は**交戦中は 0** に落としてある（ai_plan）。奥行きを合わせ切ったか
+; どうかが攻撃に移る入口だからで、そこを揺らすと永久に振らない仲間ができる。
+;
 ; 測った隔たりは ai_ydif に残す。直後の ai_try_attack がそれを使い回す
 ; （横距離 ai_dist を ai_act_one が1回だけ測って使い回しているのと同じ作りである）。
 ;
@@ -854,8 +1216,10 @@ ai_ydif:    .res 1              ; 標的との奥行きの隔たり
 .proc ai_depth_follow
         ldy ai_target, x
         lda ent_y, y
+        clc
+        adc ai_woffy, x          ; 狙う足元Y = 標的 + 揺らぎ（**交戦中は 0**。ai_plan）
         sec
-        sbc ent_y, x             ; 差 = 標的 - 自分
+        sbc ent_y, x             ; 差 = 狙う足元Y - 自分
         bcs @toward_near         ; 借りが出ない = 標的の方が手前（画面下）
         eor #$FF                 ; 奥（画面上）。8bit の絶対値を取る
         adc #1                   ; ここは carry = 0 なのでちょうど +1
