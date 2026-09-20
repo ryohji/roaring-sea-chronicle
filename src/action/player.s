@@ -29,9 +29,10 @@
 .export action_update_player
 
 .import ent_state, ent_depth_move
-.import act_step, act_face, act_hitstop, act_sub, act_dsub, act_px, act_t0
-.import act_flags
-.import act_update_actor, act_move_left, act_move_right
+.import act_step, act_face, act_hitstop, act_sub, act_dsub, act_px
+.import act_t0, act_t1, act_t2, act_t3
+.import act_flags, act_vel
+.import act_update_actor, act_move_left, act_move_right, act_speed_mag
 .import act_start_attack
 
 .assert ACT_MOVE_SPEED <= 240, error, "ACT_MOVE_SPEED が大きすぎる（小数部の累算が8bitで巻き取る）"
@@ -122,6 +123,13 @@ act_buf_atk:    .res 1       ; 攻撃の先行入力の残りフレーム
 @idle:
         lda act_buf_atk
         beq @move
+        ; **小走りの代償2**: 速すぎると振れない。
+        ; 先行入力は**捨てない**（規約）。act_player_vel が急制動をかけ、
+        ; 振れる速さまで落ちたフレームに出る。押したのに何も起きない時間は
+        ; 「止まりにかかっている」姿として画面に出ている。
+        jsr act_speed_mag
+        cmp #ACT_ATK_VEL + 1
+        bcs @move
         lda #0
         sta act_buf_atk
         lda #1
@@ -145,18 +153,43 @@ act_buf_atk:    .res 1       ; 攻撃の先行入力の残りフレーム
         jmp act_start_attack
 .endproc
 
-; X = ENT_PLAYER。左右移動。速さは 1/16 ドット単位で刻む（小数部は act_sub）。
+; ==========================================================================
+; 横移動 —— 歩きと小走り（移動の強弱）
+; ==========================================================================
+; 速さは act_vel（符号つき・1/16 ドット/フレーム）で持つ。
+; **歩く速さ以下では今までとまったく同じ**である（押した瞬間に歩く速さ、
+; 離した瞬間に停止）。主が実機で確認して「大きく改善した」と評価した手触りを
+; 変えないために、慣性が働くのは**歩く速さを超えている間だけ**にしてある。
+;
+; Bボタンを押しながら方向を入れると、歩く速さから ACT_RUN_SPEED へ加速する。
+; 代償は3つ（action_params.inc §2-a）:
+;   1 向きを変えにくい … 速いうちは逆を押しても滑るだけ（向きは変わらない）
+;   2 攻撃に移れない   … 振れる速さまで落ちるのを待つ（先行入力は保持する）
+;   3 奥行きが鈍る     … 走っている間は上下が遅い（act_player_depth）
+;
+; X = ENT_PLAYER。
 .proc act_player_move
-        lda act_pad
-        and #(PAD_LEFT | PAD_RIGHT)
+        jsr act_player_vel               ; 入力 → act_vel
+        lda act_vel, x
         bne @moving
-        lda #0
         sta act_sub, x                   ; 止まったら小数部を捨てる（歩き出しを揃える）
         rts
 @moving:
+        bmi @left
+        sta act_t0                       ; 速さの大きさ
+        lda #0                           ; 進む向き 0 = 右
+        beq @accum                       ; 必ず分岐（A = 0）
+@left:
+        eor #$FF
+        clc
+        adc #1                           ; 絶対値
+        sta act_t0
+        lda #1                           ; 進む向き 1 = 左
+@accum:
+        sta act_t1
         lda act_sub, x
         clc
-        adc #ACT_MOVE_SPEED
+        adc act_t0
         pha
         and #$0F
         sta act_sub, x
@@ -166,21 +199,188 @@ act_buf_atk:    .res 1       ; 攻撃の先行入力の残りフレーム
         lsr a
         lsr a
         sta act_px                       ; 今フレームの整数ドット数
+        beq @done                        ; 1ドットに満たない
+        lda act_t1                       ; ここで読む。act_move_* は act_t0..t3 を壊す
+        bne @go_left
+        jmp act_move_right
+@go_left:
+        jmp act_move_left
+@done:
+        rts
+.endproc
+
+; X = ENT_PLAYER。入力から act_vel を作る。act_t2 / act_t3 を作業に使う。
+;
+;   act_t2 = 望む速さ（0 = 方向入力なし）
+;   act_t3 = 望む向き（0 = 右 / 1 = 左）
+;
+; 向き（act_face）を変えるのは「歩く速さ以下まで落ちてから」である。
+; これが代償1 の実体であり、**速いほど小回りが利かない**。
+.proc act_player_vel
+        ; --- 望む向きと望む速さ ---
+        lda #0
+        sta act_t2
+        sta act_t3
         lda act_pad
         and #PAD_LEFT
-        beq @right
+        beq @try_right
         lda #1
-        sta act_face, x                  ; 左右同時押しは左を採る
-        lda act_px
-        beq @done
-        jmp act_move_left
-@right:
+        sta act_t3                       ; 左右同時押しは左を採る（今までどおり）
+        jmp @want
+@try_right:
+        lda act_pad
+        and #PAD_RIGHT
+        beq @have_want                   ; 方向入力なし。望む速さは 0 のまま
+@want:
+        lda #ACT_MOVE_SPEED
+.if ::ACT_RUN_ENABLE
+        ldy act_buf_atk
+        bne @store_want                  ; 振ろうとしている間は走らない（代償2）
+        lda act_pad
+        and #PAD_B
+        beq @walk
+        lda #ACT_RUN_SPEED
+        bne @store_want                  ; 必ず分岐
+@walk:
+        lda #ACT_MOVE_SPEED
+.endif
+@store_want:
+        sta act_t2
+@have_want:
+
+        ; --- いまの速さと向き ---
+        jsr act_speed_mag
+        sta act_t0                       ; いまの速さ
+        bne @rolling
+        ; 止まっている。押した向きへ即座に歩き出す（今までと同じ手触り）。
+        ; **走り出しは歩く速さから**。いきなり最高速にすると「小走りになる」過程が消える。
+        lda act_t2
+        beq @stopped
+        ldy act_t3
+        sty act_t1                       ; 止まっていたので向きは自由に決まる
+        cmp #ACT_MOVE_SPEED
+        bcc @to_apply
+        lda #ACT_MOVE_SPEED
+        jmp @apply
+@stopped:
         lda #0
+        sta act_vel, x
+        rts
+@to_apply:
+        jmp @apply                       ; 分岐が届かないので踏み台を1つ置く
+
+@rolling:
+        lda act_vel, x
+        bpl @cur_right
+        lda #1
+        bne @cur_have                    ; 必ず分岐
+@cur_right:
+        lda #0
+@cur_have:
+        sta act_t1                       ; いま進んでいる向き
+        lda act_t2
+        beq @brake_free                  ; 方向入力なし → 自然減速
+        lda act_t3
+        cmp act_t1
+        beq @same_dir
+        ; --- 逆を押した。速いうちは向きを変えず、滑りながら減速する（代償1）---
+        lda act_t0
+        cmp #ACT_TURN_VEL + 1
+        bcc @turn_now
+        lda #ACT_RUN_TURN_BRAKE
+        jmp @brake
+@turn_now:
+        lda act_t3
+        sta act_t1                       ; 落ち切った。ここで向きが変わる
+@same_dir:
+        lda act_t3
+        sta act_t1
+        lda act_t0
+        cmp #ACT_MOVE_SPEED
+        bcs @above_walk
+        lda act_t2                       ; 歩く速さ未満は即時（今までと同じ）
+        cmp #ACT_MOVE_SPEED
+        bcc @to_apply
+        lda #ACT_MOVE_SPEED
+        jmp @apply
+@above_walk:
+        lda act_t2
+        cmp act_t0
+        beq @keep
+        bcc @slow_down
+        lda act_t0                       ; 加速（小走りへ）
+        clc
+        adc #ACT_RUN_ACCEL
+        cmp act_t2
+        bcc @to_apply
+        lda act_t2                       ; 最高速に届いた
+        jmp @apply
+@slow_down:
+        ; Bを離した／振ろうとしている。歩く速さまで慣性で落ちる。
+        ; 振ろうとしているときだけ急制動にするのは、**先行入力の寿命に間に合わせる**
+        ; ためである（ACT_BUF_FRAMES より短いフレーム数で振れる速さまで落ちること）。
+        lda act_buf_atk
+        beq @coast_down
+        lda #ACT_ATK_BRAKE
+        jmp @brake
+@coast_down:
+        lda #ACT_RUN_BRAKE
+        jmp @brake
+@keep:
+        lda act_t0
+        jmp @apply
+
+@brake_free:
+        ; 方向入力なし。歩く速さ以下なら即停止（今までと同じ）、
+        ; 超えていれば滑ってから止まる（代償3の裏返し。**止まるのに時間がかかる**）。
+        lda act_t0
+        cmp #ACT_MOVE_SPEED + 1
+        bcc @halt
+        lda act_buf_atk
+        beq @coast
+        lda #ACT_ATK_BRAKE               ; 振ろうとしている。急いで止まる（代償2）
+        jmp @brake
+@coast:
+        lda #ACT_RUN_BRAKE
+        jmp @brake
+@halt:
+        lda #0
+        sta act_vel, x
+        sta act_sub, x
+        rts
+
+        ; A = 減速量。act_t0 から引いて act_t1 の向きのまま入れ直す。
+@brake:
+        sta act_t3
+        lda act_t0
+        sec
+        sbc act_t3
+        bcs @apply
+        lda #0
+        ; act_apply へ
+
+        ; A = 新しい速さ（大きさ）, act_t1 = 進む向き。符号つきにして入れる。
+        ;
+        ; **絵の向き（act_face）は「進んでいる向き」である**（望む向きではない）。
+        ; act_t1 が望む向きに変わるのは ACT_TURN_VEL 以下まで落ちたときだけなので、
+        ; 速いうちに逆を押しても背を向けない ＝ 代償1 がそのまま絵に出る。
+@apply:
+        sta act_t0
+        beq @zero
+        lda act_t1
         sta act_face, x
-        lda act_px
-        beq @done
-        jmp act_move_right
-@done:
+        lda act_t0
+        ldy act_t1
+        beq @store
+        eor #$FF
+        clc
+        adc #1                           ; 左向きは負
+@store:
+        sta act_vel, x
+        rts
+@zero:
+        sta act_vel, x
+        sta act_sub, x
         rts
 .endproc
 
@@ -200,9 +400,16 @@ act_buf_atk:    .res 1       ; 攻撃の先行入力の残りフレーム
         sta act_dsub, x                  ; 止まったら小数部を捨てる（歩き出しを揃える）
         rts
 @moving:
-        lda act_dsub, x
-        clc
-        adc #ACT_DEPTH_SPEED
+        ; **小走りの代償3**: 走っている間は奥行きが鈍る。
+        ; 横に速い代わりに、縦の回避は歩いた方が速い。
+        ; 予備動作を見てから奥へ避けるなら、走るのをやめる判断が要る。
+        jsr act_speed_mag
+        cmp #ACT_MOVE_SPEED + 1
+        lda #ACT_DEPTH_SPEED
+        bcc :+
+        lda #ACT_RUN_DEPTH_SPEED
+:       clc
+        adc act_dsub, x
         pha
         and #$0F
         sta act_dsub, x

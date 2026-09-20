@@ -19,6 +19,7 @@
 ; --- 付随テーブル（エンティティ番号で引く。engine の SoA と同じ添字）---
 .export act_hp, act_timer, act_step, act_face, act_invuln, act_hitstop
 .export act_kb, act_flags, act_attr0, act_sub, act_dsub
+.export act_vel, act_mset, act_cy, act_proj_owner
 ; --- 作業変数（engine 呼び出しをまたいでも保つ必要がある）---
 .export act_px, act_t0, act_t1, act_t2, act_t3
 .export act_atk_ent, act_scan_end, act_kb_dir, act_kb_amt, act_dmg_amt
@@ -28,13 +29,16 @@
 ; --- 手続き ---
 .export action_init, act_init_entity, action_update, act_update_actor
 .export act_role, act_move_left, act_move_right, act_set_pal
+.export act_shift_left, act_shift_right, act_speed_mag, act_can_move
 .export act_enter_down, act_grace_expired, action_revive
 
-.import ent_active, ent_state, ent_attr, ent_body
+.import ent_active, ent_state, ent_attr, ent_body, ent_y
 .import ent_x_lo, ent_x_hi, ent_kill, ent_set_pose
 .import stage_w_lo, stage_w_hi
 .import act_grace_frames, act_hp_by_body, act_pose_by_state
-.import act_attack_step, act_damage
+.import act_mset_by_role
+.import act_attack_step, act_damage, act_row_for, act_proj_update
+.import atk_startup
 .import act_input_gate, act_input_buffer, act_input_drop, action_update_player
 .import act_pad_new
 
@@ -51,6 +55,21 @@ act_flags:    .res MAX_ENTITIES   ; ACT_F_*
 act_attr0:    .res MAX_ENTITIES   ; 本来の ent_attr（点滅から戻すために覚えておく）
 act_sub:      .res MAX_ENTITIES   ; 横移動の小数部（1/16 ドット）
 act_dsub:     .res MAX_ENTITIES   ; 奥行き移動の小数部（1/16 ドット）。ADR-0009
+; 横方向の速度（符号つき・1/16 ドット/フレーム）。**歩きと小走りの強弱の実体**である。
+; 歩く速さ以下では押した瞬間に入り離した瞬間に 0 になる（＝今までと同じ手触り）。
+; 慣性が出るのは歩く速さを超えている間だけ（action_params.inc §2-a）。
+; 飛び道具も AI が動かす者も 0 のままで、歩きの絵の周期に影響しない。
+act_vel:      .res MAX_ENTITIES
+; 技構成（ACT_MSET_*）。**敵の攻撃を操作キャラのコンボ表から分離する鍵**。
+; 既定は立場から決まる（act_mset_by_role）。遠隔の敵は ai-dev がここを書き換える。
+act_mset:     .res MAX_ENTITIES
+; 振り始めに固定した足元Y（commit）。攻撃中はここへ毎フレーム引き戻す。
+; 溜めている間に奥行きを追尾させないための1バイトであり、
+; **予備動作を長くしたことが意味を持つかどうかは、この値を守れるかで決まる。**
+act_cy:       .res MAX_ENTITIES
+; 空き枠に居る飛び道具を撃った主のエンティティ番号（枠1つにつき1バイト）。
+; 弾が誰を狙う側なのかは、番号ではなく**撃った主の立場**で決まる（combat.s）。
+act_proj_owner: .res ENT_FREE_COUNT
 
 act_px:       .res 1              ; 今回動かすドット数
 act_t0:       .res 1              ; 16bit 計算の作業
@@ -85,15 +104,45 @@ act_player_failed: .res 1
         sta act_kb_dir
         sta act_kb_amt
         jsr act_input_drop               ; 先行入力と実効パッドを空にする
+        lda #0
+        ldx #ENT_FREE_COUNT - 1
+@owner:
+        sta act_proj_owner, x
+        dex
+        bpl @owner
         ldx #MAX_ENTITIES - 1
 @loop:
         jsr act_init_entity
         dex
         bpl @loop
+.if ::ACT_DBG_SHOOTER
+        jsr act_dbg_make_shooter
+.endif
         lda #1
         sta act_ready
         rts
 .endproc
+
+.if ::ACT_DBG_SHOOTER
+; P2 の確認用。**遠隔の敵は ai-dev が作る**（AI 側の型がまだ無い）。
+; それまで主が飛び道具を実機で見られるように、いちばん後ろの敵1体だけを
+; 遠隔の技構成にする。**仕様ではない。** ai-dev が act_mset を詰めるようになったら
+; ACT_DBG_SHOOTER を 0 にする（ai_init は action_init の後なので、両方あれば ai が勝つ）。
+.proc act_dbg_make_shooter
+        ldx #ENT_ENEMY_FIRST + ENT_ENEMY_COUNT - 1
+@find:
+        lda ent_active, x
+        bne @found
+        dex
+        cpx #ENT_ENEMY_FIRST
+        bcs @find
+        rts
+@found:
+        lda #ACT_MSET_SHOOT
+        sta act_mset, x
+        rts
+.endproc
+.endif
 
 ; X = エンティティ番号。1体ぶんの初期化。
 ; 途中で湧いた敵（P3 の waves）にも、配置直後にこれを呼べばよい。
@@ -108,7 +157,11 @@ act_player_failed: .res 1
         sta act_flags, x
         sta act_sub, x
         sta act_dsub, x
+        sta act_vel, x
+        sta act_mset, x                  ; = ACT_MSET_PARTY。有効なら立場で上書きする
         sta act_hp, x
+        lda ent_y, x
+        sta act_cy, x                    ; commit の初期値は「いま立っている奥行き」
         lda ent_active, x
         beq @done
         lda ent_attr, x
@@ -116,6 +169,10 @@ act_player_failed: .res 1
         lda #ACT_ST_IDLE
         sta ent_state, x
         jsr act_role
+        tay
+        lda act_mset_by_role, y          ; 立場ごとの既定の技構成（敵は敵の表を引く）
+        sta act_mset, x
+        tya
         cmp #ACT_ROLE_ENEMY
         beq @enemy
         lda #ACT_HP_PARTY                ; 操作キャラ・仲間（P4 で roster データに置き換わる）
@@ -153,7 +210,8 @@ act_player_failed: .res 1
 ;   2. 先行入力バッファの寿命（ヒットストップ中でも捨てない。規約）
 ;   3. 操作キャラの更新（時間経過 → 入力）
 ;   4. 仲間・敵の更新（**行動は決めない**。被弾反応の時間経過だけ。行動は ai-dev）
-;   5. 提示（点滅など）
+;   5. 飛び道具の進行（空き枠。出る・飛ぶ・当たる・消える）
+;   6. 提示（点滅など）
 .proc action_update
         lda act_ready
         bne @ready
@@ -177,6 +235,10 @@ act_player_failed: .res 1
         inx
         cpx #ENT_FREE_FIRST
         bcc @loop
+
+        ; 飛び道具は**人の更新の後**に進める。撃たれたその瞬間のフレームにも
+        ; 1歩ぶん飛ぶので、銃口に1フレーム貼り付いて見えることがない。
+        jsr act_proj_update
 
         jmp act_present_all
 .endproc
@@ -250,6 +312,7 @@ act_player_failed: .res 1
         sta act_step, x
         sta act_invuln, x                ; ダウン中は act_damage 側で弾くので無敵は要らない
         sta act_flags, x
+        sta act_vel, x                   ; 倒れたら走りも止まる
         jsr act_role
         tay
         lda act_grace_frames, y          ; 猶予の長さは立場ごとの表から（データ側）
@@ -315,6 +378,7 @@ act_player_failed: .res 1
         sta act_flags, x
         sta act_sub, x
         sta act_dsub, x
+        sta act_vel, x                   ; 復帰は「何も押していない・止まっている」から始める
         lda #ACT_REVIVE_INVULN
         sta act_invuln, x
         cpx #ENT_PLAYER
@@ -340,7 +404,7 @@ act_player_failed: .res 1
         beq @done
         bmi @left
         sta act_px
-        jsr act_move_right
+        jsr act_shift_right              ; **門を通さない**（攻撃中でも吹き飛ぶ）
         lda act_kb, x
         sec
         sbc #ACT_KB_DECAY
@@ -354,7 +418,7 @@ act_player_failed: .res 1
         clc
         adc #1                           ; 絶対値
         sta act_px
-        jsr act_move_left
+        jsr act_shift_left               ; **門を通さない**（攻撃中でも吹き飛ぶ）
         lda act_kb, x
         clc
         adc #ACT_KB_DECAY
@@ -374,12 +438,66 @@ act_player_failed: .res 1
         rts
 .endproc
 
+; X = エンティティ番号 → キャリークリア = 自分の足で動いてよい /
+;                        キャリーセット = 攻撃中なので**その場に根が生える**。
+; A を壊す。X と Y は保存して返る。
+;
+; 攻撃の3相（発生・持続・硬直）の間は動けない。これは commit の一部である:
+; 溜めている間に踏み込まれたら、当たる位置も一緒に動いてしまう。
+; **ノックバックはここを通らない**（act_shift_* を直に呼ぶ）。殴られて吹き飛ぶのは
+; 「自分の足で動く」ことではないからである。
+.proc act_can_move
+.if ::ACT_ATTACK_ROOT
+        lda ent_state, x
+        cmp #ACT_ST_ATK_START
+        bcc @ok                          ; ACT_ST_IDLE
+        cmp #ACT_ST_ATK_RECOVER + 1
+        bcs @ok                          ; のけぞり以上（動かす主体はもう自分ではない）
+        sec
+        rts
+.endif
+@ok:
+        clc
+        rts
+.endproc
+
+; X = エンティティ番号, act_px = ドット数。**自分の足で**左右へ動く入口。
+; プレイヤーの移動と AI の移動はどちらもここを通る（攻撃中の扱いを1箇所にするため）。
+; 攻撃中は動かず、「今フレーム動いた」印も立たない（歩きの絵にならない）。
+.proc act_move_left
+        jsr act_can_move
+        bcs @rooted
+        jsr act_mark_moved
+        jmp act_shift_left
+@rooted:
+        rts
+.endproc
+
+.proc act_move_right
+        jsr act_can_move
+        bcs @rooted
+        jsr act_mark_moved
+        jmp act_shift_right
+@rooted:
+        rts
+.endproc
+
+; X = エンティティ番号 → A = |act_vel|（速さの大きさ）。X と Y は保存して返る。
+; 歩きか小走りかの判定（絵のコマ送り・向きの変え方・攻撃に移れるか）はすべてこれで見る。
+.proc act_speed_mag
+        lda act_vel, x
+        bpl @done
+        eor #$FF
+        clc
+        adc #1
+@done:
+        rts
+.endproc
+
 ; X = エンティティ番号, act_px = ドット数。ワールドの左端 (0) を越えさせない。
 ; 越えると 16bit が巻き取って「ステージの遥か右」になり、カメラが飛ぶ。
-; ついでに「今フレーム動いた」を立てる。歩きの絵に切り替えるためであり、
-; **プレイヤーと AI のどちらが動かしても同じように歩いて見える**ようにここに置いてある。
-.proc act_move_left
-        jsr act_mark_moved
+; **門も印も通らない生の移動**である（ノックバックと飛び道具が使う）。
+.proc act_shift_left
         lda ent_x_lo, x
         sec
         sbc act_px
@@ -400,8 +518,8 @@ act_player_failed: .res 1
 
 ; X = エンティティ番号, act_px = ドット数。ステージ右端（幅 - 余白）で止める。
 ; ステージ幅は scroll.s が持っている。ここに長さを埋めない。
-.proc act_move_right
-        jsr act_mark_moved
+; **門も印も通らない生の移動**である（ノックバックと飛び道具が使う）。
+.proc act_shift_right
         lda ent_x_lo, x
         clc
         adc act_px
@@ -489,6 +607,11 @@ act_player_failed: .res 1
         beq @down
         lda act_invuln, x
         bne @invuln
+.if ::ACT_SHOW_TELL
+        lda ent_state, x
+        cmp #ACT_ST_ATK_START
+        beq @tell
+.endif
 .if ::ACT_SHOW_ACTIVE
         lda ent_state, x
         cmp #ACT_ST_ATK_ACTIVE
@@ -501,6 +624,22 @@ act_player_failed: .res 1
 .if ::ACT_SHOW_ACTIVE
 @active:
         lda #ACT_PAL_ACTIVE              ; 攻撃判定が出ているフレーム（既定では使わない）
+        jmp act_set_pal
+.endif
+.if ::ACT_SHOW_TELL
+; 予備動作中（溜めている最中）。**長い振りだけ**点滅させる。
+; 「溜めているのが見える」ことは、避けられる攻撃の要件そのものである。
+; 短い振り（操作キャラの初段は4フレーム）まで点滅させると画面が騒がしくなるだけなので、
+; その行の発生フレーム数が ACT_TELL_MIN 以上のときだけ光る。
+@tell:
+        jsr act_row_for
+        lda atk_startup, y
+        cmp #ACT_TELL_MIN
+        bcc @base
+        lda #ACT_BLINK_TELL
+        and frame_counter
+        beq @base
+        lda #ACT_PAL_TELL
         jmp act_set_pal
 .endif
 @invuln:
@@ -541,8 +680,14 @@ act_player_failed: .res 1
         lda act_flags, x
         and #ACT_F_MOVED
         beq @stand
-        lda frame_counter
-        and #ACT_WALK_ANIM
+        ; 小走りの絵は無い（chr/ は範囲外）。**コマ送りを速くして強弱を見せる。**
+        ; 歩く速さを超えている間だけ周期が半分になる。
+        jsr act_speed_mag
+        cmp #ACT_MOVE_SPEED + 1
+        lda #ACT_WALK_ANIM
+        bcc :+
+        lda #ACT_RUN_ANIM
+:       and frame_counter
         beq @stand
         lda #ACT_POSE_MOVE
         jmp @set

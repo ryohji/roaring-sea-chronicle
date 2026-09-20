@@ -1,10 +1,20 @@
 ; combat.s — 攻撃の相（発生・持続・硬直）、当たり判定、ダメージ。
 ;
 ; 責務:
-;   * 攻撃矩形の組み立て（向き × 段数の表から。数値は action_params.s）
+;   * 攻撃矩形の組み立て（向き × **技表の行**から。数値は action_params.s）
+;   * **技構成**（act_mset）— 操作キャラのコンボと敵の攻撃を別の行として引く
+;   * **commit** — 振り始めた瞬間の足元Y・向きを固定し、溜めている間は追尾しない
 ;   * **奥行き方向の攻撃の可否**（Y許容幅 act_depth_tol。ADR-0009。P1 の受入条件）
 ;   * 命中時のヒットストップ・ノックバック・無敵の付与
+;   * **飛び道具**（出る・飛ぶ・当たる・消える）。当たり判定は action の持ち分
 ;   * **攻撃の届く範囲と当たった位置を画面に出す**（斬り／衝撃の効果スプライト）
+;
+; **敵の攻撃を操作キャラのコンボ表から分離したのが、このファイルの一番大きな変更である。**
+; 敵が操作キャラの1段目を借りていた頃、敵の発生は 4 フレーム（0.067秒）だった。
+; 人間の反応の限界（12フレーム）より短い攻撃は**原理的に避けられない**。
+; 避けられない攻撃の前では立ち位置を選ぶ意味が無く、空間が使われない。
+; 予備動作を長くしただけでは足りず、**溜めている間に狙いが追尾しないこと**（commit）が
+; 同じだけ重要である。追尾すると、踏み込んで避けても当たってしまう。
 ;
 ; engine の当たり判定プリミティブ（rect_overlap / depth_distance）と、効果スプライトの
 ; 枠（fx_spawn）を**使う側**である。判定ルール（Y何ドットまで届くか・何段目が何ドットか）と
@@ -24,19 +34,25 @@
 .include "action_params.inc"
 
 .export act_attack_step, act_start_attack, act_damage
+.export act_row_for, act_commit_hold
+.export act_proj_fire, act_proj_update
 
 .import ent_active, ent_state, ent_body, ent_y
-.import ent_x_lo, ent_x_hi
+.import ent_x_lo, ent_x_hi, ent_class, ent_tile, ent_attr, ent_ai
+.import ent_activate, ent_find_free, ent_kill
 .import rect_overlap, depth_distance, fx_spawn
 .import act_hp, act_timer, act_step, act_face, act_invuln, act_hitstop
-.import act_kb, act_flags
-.import act_px, act_t0, act_atk_ent, act_scan_end
+.import act_kb, act_flags, act_sub, act_dsub, act_vel
+.import act_mset, act_cy, act_proj_owner, act_attr0
+.import act_px, act_t0, act_t1, act_t2, act_atk_ent, act_scan_end
 .import act_kb_dir, act_kb_amt, act_dmg_amt
 .import act_dy, act_tol
-.import act_enter_down
+.import act_enter_down, act_shift_left, act_shift_right
 .import act_hurt_w, act_hurt_h, act_depth_tol
+.import act_mset_base, act_mset_len
 .import atk_startup, atk_active, atk_recover
 .import atk_reach, atk_w, atk_h, atk_dmg, atk_kb
+.import atk_proj, atk_speed, atk_life
 
 .segment "CODE"
 
@@ -44,17 +60,75 @@
 ; 攻撃の状態機械
 ; ==========================================================================
 
-; X = エンティティ番号, A = 段数（1..ACT_COMBO_MAX）。攻撃を開始する。
-.proc act_start_attack
-        sta act_step, x
+; X = エンティティ番号 → Y = 技表の行（ATK_ROW_*）。A を壊す。X は保存して返る。
+;
+; 行 = その者の技構成の先頭 + 段数 - 1。**段数と行を分けたことが、
+; 「敵の攻撃を操作キャラのコンボ表から分離する」ことの実体である。**
+; 呼び出し側（ai-dev を含む）は今までどおり「段数」で振れる。
+.proc act_row_for
+        lda act_mset, x
         tay
-        dey                              ; Y = 表の添字（段数 - 1）
+        lda act_mset_base, y
+        clc
+        adc act_step, x
+        sec
+        sbc #1                           ; 段数は 1 から数える
+        tay
+        rts
+.endproc
+
+; X = エンティティ番号, A = 段数（1..）。攻撃を開始する。
+; 段数がその技構成の持つ段数を超えていたら丸める（敵の技構成は1段しかない）。
+;
+; **ここが commit の起点である。** 振り始めた瞬間の足元Y（＝狙う奥行き）と向きを
+; 写し取り、攻撃が終わるまでそれを保つ。溜めている間に追尾すると、
+; 踏み込んで避けても当たってしまい、予備動作を長くした意味が消える。
+.proc act_start_attack
+        pha
+        lda act_mset, x
+        tay
+        pla
+        cmp act_mset_len, y
+        bcc @step
+        beq @step
+        lda act_mset_len, y              ; 段数を丸める
+@step:
+        sta act_step, x
         lda #ACT_ST_ATK_START
         sta ent_state, x
+
+        ; --- commit: 狙う奥行き（足元Y）と向きを固定する ---
+        lda ent_y, x
+        sta act_cy, x
         lda #0
-        sta act_flags, x
+        sta act_vel, x                   ; 振ったら走りは止まる（根が生える）
+        ldy act_face, x
+        beq @right
+        lda #ACT_F_CFACE
+@right:
+        sta act_flags, x                 ; ACT_F_HIT / ACT_F_MOVED は下ろす
+
+        jsr act_row_for
         lda atk_startup, y
         jmp act_set_phase
+.endproc
+
+; X = エンティティ番号。commit した狙いを保つ。攻撃中の毎フレーム、
+; 判定を見る**前に**呼ぶ。A と Y を壊す。X は保存して返る。
+;
+; 誰が足元Yや向きを触っても、振りは**振り始めた位置・向き**のまま出る。
+; ai 側は攻撃中のエンティティに手を出さない作りだが、commit を
+; 「相手の作法」に依存させない。ここが崩れると避ける遊びが丸ごと崩れる。
+.proc act_commit_hold
+        lda act_cy, x
+        sta ent_y, x
+        lda act_flags, x
+        and #ACT_F_CFACE
+        beq @right
+        lda #1
+@right:
+        sta act_face, x
+        rts
 .endproc
 
 ; X = エンティティ番号, A = 相のフレーム数。0 を 1 に読み替えてから入れる。
@@ -68,6 +142,7 @@
 
 ; X = エンティティ番号。攻撃中の1フレーム。X は保存して返る。
 .proc act_attack_step
+        jsr act_commit_hold              ; 振り始めに固定した狙いを保つ（追尾しない）
         lda ent_state, x
         cmp #ACT_ST_ATK_ACTIVE
         bne @tick
@@ -96,12 +171,23 @@
 @to_active:
         lda #ACT_ST_ATK_ACTIVE
         sta ent_state, x
-        ldy act_step, x
-        dey
-        lda #0
+        lda act_flags, x
+        and #<~ACT_F_HIT                 ; 当たり直しを許す（commit した向きは残す）
         sta act_flags, x
+        jsr act_row_for
         lda atk_active, y
         jsr act_set_phase
+        jsr act_row_for
+        lda atk_proj, y
+        bmi @melee                       ; ATK_NO_PROJ = $FF。素手の行
+        ; 飛び道具を出す行。**矩形の判定は出さない**（至近で二重に当たるため）。
+        ; 出た印として ACT_F_HIT を立て、この振りの走査を丸ごと飛ばす。
+        jsr act_proj_fire
+        lda act_flags, x
+        ora #ACT_F_HIT
+        sta act_flags, x
+        rts
+@melee:
 .if ::ACT_SHOW_SWIPE
         jmp act_spawn_swipe              ; 判定が出た瞬間に、その位置へ斬りを出す
 .else
@@ -110,8 +196,7 @@
 @to_recover:
         lda #ACT_ST_ATK_RECOVER
         sta ent_state, x
-        ldy act_step, x
-        dey
+        jsr act_row_for
         lda atk_recover, y
         jmp act_set_phase
 .endproc
@@ -125,6 +210,13 @@
 .proc act_hit_scan
         stx act_atk_ent
         jsr act_build_attack_rect
+        ; act_scan_targets へ落ちる
+.endproc
+
+; rect_a と act_atk_ent を詰めてから呼ぶ。攻撃側の立場から標的の区画を決めて走査する。
+; 飛び道具もここを通る（矩形の組み立て方だけが違う）。
+; 出口で X = act_atk_ent に戻る。
+.proc act_scan_targets
         jsr act_target_range             ; X = 走査の先頭, act_scan_end = 終端
 @loop:
         cpx act_scan_end
@@ -152,8 +244,17 @@
 
 ; act_atk_ent の立場から、殴る相手の区画を決める。
 ;   出力: X = 先頭の添字, act_scan_end = 終端（この番号は含まない）
+;
+; **飛び道具は「撃った主の立場」で決める。** 弾はエンティティの空き枠に入るので
+; 番号だけで見ると必ず敵区画より後ろになり、味方が撃った弾が味方を狙ってしまう。
+; 撃った主は act_proj_owner（空き枠1つにつき1バイト）が覚えている。
 .proc act_target_range
         lda act_atk_ent
+        cmp #ENT_FREE_FIRST
+        bcc @by_slot
+        tay
+        lda act_proj_owner - ENT_FREE_FIRST, y
+@by_slot:
         cmp #ENT_ENEMY_FIRST
         bcs @enemy_attacks
         lda #ENT_ENEMY_FIRST + ENT_ENEMY_COUNT
@@ -206,8 +307,7 @@
 ;   左向き: 右端 = ワールドX        - atk_reach
 ;   縦    : 足元から上へ atk_h
 .proc act_build_attack_rect
-        ldy act_step, x
-        dey
+        jsr act_row_for
         lda atk_w, y
         sta rect_a + RECT_W
         lda atk_h, y
@@ -282,9 +382,12 @@
         sta act_flags, y
         lda act_face, y
         sta act_kb_dir                   ; 吹き飛ぶ向きは攻撃側の向き
-        lda act_step, y
-        tay
-        dey
+        txa
+        pha                              ; 被弾側の番号を退避（行を引く間 X を貸す）
+        ldx act_atk_ent
+        jsr act_row_for
+        pla
+        tax
         lda atk_kb, y
         sta act_kb_amt
         lda atk_dmg, y
@@ -309,6 +412,11 @@
 @done:
         rts
 @accept:
+        ; 殴られたら走りは止まる。ノックバックと自走が同時に乗ると、
+        ; 吹き飛びの距離が「そのとき走っていたか」で変わって読めなくなる。
+        lda #0
+        sta act_vel, x
+
         ; --- ノックバック（速度を入れるだけ。運ぶのは actor.s）---
         lda act_kb_dir
         beq @kb_right
@@ -403,8 +511,7 @@
         beq :+
         ora #ENT_ATTR_HFLIP              ; 左向きの攻撃は絵も裏返す
 :       sta fx_arg_attr
-        ldy act_step, x
-        dey
+        jsr act_row_for
         lda atk_active, y
         clc
         adc #1
@@ -447,3 +554,185 @@
         jmp fx_spawn
 .endproc
 .endif
+
+; ==========================================================================
+; 飛び道具 —— 出る・飛ぶ・当たる・消える
+; ==========================================================================
+; **当たり判定は action の持ち分**なので、弾の進行と判定もここにある
+; （ai-dev が書くのは「いつ撃つか」だけである）。
+;
+; 弾はエンティティの**空き枠**（ENT_FREE_FIRST..MAX_ENTITIES = 7枠）に入る。
+; 短命の効果（src/engine/fx.s）ではなく本物のエンティティにしてあるのは、
+;   * 当たり判定を持つ（fx は判定を持たない道具である）
+;   * OAM の並べ替えに乗る＝奥行きの前後関係が正しく描かれる
+;   * 優先度クラス SPR_CLASS_PROJECT を名乗れる。ADR-0002 が
+;     「当たり判定があるのに見えないのが最も理不尽」として操作キャラの次に置いたクラス
+; の3つによる。
+;
+; 枠が無いときは**黙って出ない**。撃った側の振りは成立し、弾だけが出ない。
+; ここで詰まって撃てなくなるより、たまに弾が出ない方が害が小さい。
+;
+; **絵は衝撃（SPR_TILE_IMPACT）の流用である**（ACT_PROJ_TILE）。
+; 専用の絵が入ったら action_params.inc のその1行を差し替えればよい。
+
+; X = 撃つ主体, Y = その者が振っている技表の行（atk_proj が弾の行を指していること）。
+; X は保存して返る。枠が無ければ何もしない。
+.proc act_proj_fire
+        lda atk_proj, y
+        sta act_t1                       ; 弾の行（ATK_ROW_*）
+        jsr act_build_attack_rect        ; 銃口の位置。その行の reach / w が決める
+        stx act_t2                       ; 撃つ主体
+        ldx #ENT_FREE_FIRST
+        ldy #ENT_FREE_COUNT
+        jsr ent_find_free
+        bcc @found
+        ldx act_t2                       ; 空き枠なし。黙って出ない（弾は消えてよい）
+        rts
+@found:
+
+        ; --- 位置。奥行きは**振り始めに固定した足元Y**（commit）である ---
+        lda rect_a + RECT_X_LO
+        sta ent_x_lo, x
+        lda rect_a + RECT_X_HI
+        sta ent_x_hi, x
+        ldy act_t2
+        lda act_cy, y
+        sta ent_y, x
+        lda act_face, y
+        sta act_face, x                  ; 飛ぶ向きも commit した向きを継ぐ
+        txa
+        tay
+        lda act_t2
+        sta act_proj_owner - ENT_FREE_FIRST, y   ; 撃った主（狙う区画を決めるのに要る）
+
+        ; --- 見た目 ---
+        lda #SPR_CLASS_PROJECT
+        sta ent_class, x
+        lda #BODY_PLACEHOLDER            ; 奥行きのY許容幅を引くための体格
+        sta ent_body, x
+        lda #ACT_PROJ_TILE
+        sta ent_tile, x
+        lda #SPR_PAL_EFFECT
+        sta ent_attr, x
+        lda #ACT_ST_IDLE
+        sta ent_state, x
+
+        ; --- 付随テーブル。弾は「1段しかない技構成」を持つ者として判定を引く ---
+        lda #0
+        sta ent_ai, x
+        sta act_sub, x
+        sta act_dsub, x
+        sta act_vel, x
+        sta act_kb, x
+        sta act_invuln, x
+        sta act_hp, x
+        sta act_cy, x
+        lda #1
+        sta act_step, x
+        lda #ACT_MSET_BULLET
+        sta act_mset, x
+        lda #ACT_PROJ_ARM                ; 出たフレームは止まって見える（見えない判定を作らない）
+        sta act_hitstop, x
+        lda #ACT_F_PROJ
+        sta act_flags, x
+        ldy act_t1
+        lda atk_life, y
+        bne :+
+        lda #1                           ; 0 だと寿命の減算が 255 に化けて消えなくなる
+:       sta act_timer, x
+
+        jsr ent_activate                 ; 帯へのクランプと先頭タイルの記憶は engine の持ち分
+.if ::ACT_PROJ_SHADOW = 0
+        lda ent_attr, x
+        and #<~ENT_ATTR_SHADOW
+        sta ent_attr, x
+.endif
+        lda ent_attr, x
+        sta act_attr0, x                 ; 本来の色（提示が点滅から戻すときに読む）
+        ldx act_t2
+        rts
+.endproc
+
+; 毎フレーム1回。空き枠に居る弾だけを進める。
+; **人の枠（ENT_PLAYER..ENT_ENEMY_*）はここを通らない。**
+.proc act_proj_update
+        ldx #ENT_FREE_FIRST
+@loop:
+        lda ent_active, x
+        beq @next
+        lda act_flags, x
+        and #ACT_F_PROJ
+        beq @next                        ; 空き枠に居る別のもの（将来のアイテムなど）
+        jsr act_proj_step
+@next:
+        inx
+        cpx #MAX_ENTITIES
+        bcc @loop
+        rts
+.endproc
+
+; X = 弾。寿命 → 移動 → 判定の順に1フレーム進める。X は保存して返る。
+; 当たったフレームに消える（貫通しない）。壁は無いので、外れた弾は寿命で消える。
+.proc act_proj_step
+        lda act_hitstop, x
+        beq @live
+        dec act_hitstop, x               ; 出たばかり。まだ飛ばないし当たらない
+        rts
+@live:
+        dec act_timer, x
+        beq @expire
+
+        jsr act_row_for
+        lda act_sub, x
+        clc
+        adc atk_speed, y                 ; 速さは 1/16 ドット/フレーム
+        pha
+        and #$0F
+        sta act_sub, x
+        pla
+        lsr a
+        lsr a
+        lsr a
+        lsr a
+        sta act_px
+        beq @scan                        ; 今フレームは1ドットに満たない（判定は出す）
+        lda act_face, x
+        bne @left
+        jsr act_shift_right              ; ステージ端のクランプ込み。止まっても寿命で消える
+        jmp @scan
+@left:
+        jsr act_shift_left
+@scan:
+        stx act_atk_ent
+        jsr act_build_proj_rect
+        jsr act_scan_targets
+        lda act_flags, x
+        and #ACT_F_HIT
+        beq @done
+@expire:
+        lda #0
+        sta act_flags, x                 ; 飛び道具の印を下ろす（枠を次の弾に返す）
+        jmp ent_kill
+@done:
+        rts
+.endproc
+
+; X = 弾。**弾の絵そのもの**を当たり判定にする（原点から幅 atk_w・足元から高さ atk_h）。
+; 人の攻撃と違って体の前端から前へ伸ばさないのは、弾には「体」と「間合い」の区別が
+; 無いからである。見えている絵と判定が一致している方が、避ける側から読みやすい。
+.proc act_build_proj_rect
+        jsr act_row_for
+        lda atk_w, y
+        sta rect_a + RECT_W
+        lda atk_h, y
+        sta rect_a + RECT_H
+        lda ent_x_lo, x
+        sta rect_a + RECT_X_LO
+        lda ent_x_hi, x
+        sta rect_a + RECT_X_HI
+        lda ent_y, x
+        sec
+        sbc rect_a + RECT_H
+        sta rect_a + RECT_Y
+        rts
+.endproc
