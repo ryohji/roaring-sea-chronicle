@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.join(HERE, "harness"))
 sys.path.insert(0, HERE)
 
 from cpu6502 import CpuCrash                        # noqa: E402
-from nes import Nes, boot, frame_end, load_labels   # noqa: E402
+from nes import Nes, boot, frame_end, load_labels, step_frame   # noqa: E402
 from scene import slot_ranges                       # noqa: E402
 from gate import Gate, run_sections, boot_or_fail   # noqa: E402
 from srcdefs import action_defs, body_rows          # noqa: E402
@@ -81,6 +81,21 @@ class Actors:
     def x(self, i):
         return self.get("ent_x_lo", i) | (self.get("ent_x_hi", i) << 8)
 
+    def hold(self, buttons, frames, watch=None):
+        """buttons を押したまま frames 進め、**各フレームの更新が終わった点**で観測する。
+
+        入力から来る挙動（歩き・小走り・先行入力）は、作業変数（act_vel / act_sub /
+        act_buf_atk）を毎フレーム読まないと見えない。run_frames の戻り位置は更新の
+        最中なので、必ずフレームの切れ目まで進めてから読む（test/harness/nes.py 冒頭）。
+        """
+        self.nes.set_buttons(set(buttons))
+        out = []
+        for _ in range(frames):
+            step_frame(self.nes, self.labels, 1)
+            if watch is not None:
+                out.append(watch(self))
+        return out
+
     def sleep_all(self):
         """全エンティティを眠らせる。見たい2体だけを自分で起こすため。"""
         for i in range(self.slots["count"]):
@@ -117,6 +132,25 @@ def layer2_action(rom_path, labels, r):
         ("姿勢（攻撃とのけぞりが別の絵）",
          ("act_present", "act_pose_by_state", "ent_set_pose", "ent_tile0",
           "act_flags", "frame_counter"), _check_poses),
+        ("敵の攻撃が避けられる",
+         ("act_start_attack", "act_update_actor", "action_update_player", "act_pad",
+          "act_mset", "act_mset_base", "atk_startup", "atk_active", "atk_reach",
+          "act_hurt_w", "act_depth_tol", "depth_y_min", "depth_y_max", "act_hp",
+          "act_init_entity", "act_flags"), _check_dodge),
+        ("commit とノックバック",
+         ("act_start_attack", "act_update_actor", "act_commit_hold", "act_cy",
+          "act_move_right", "act_px", "act_kb", "act_damage", "act_kb_dir",
+          "act_kb_amt", "act_atk_ent", "act_mset", "act_mset_base", "atk_startup",
+          "atk_active", "atk_reach", "act_hurt_w", "act_depth_tol", "depth_y_min",
+          "act_init_entity", "act_hp", "act_flags"), _check_commit),
+        ("飛び道具",
+         ("act_proj_update", "act_proj_owner", "act_start_attack", "act_update_actor",
+          "act_mset", "act_mset_base", "atk_startup", "atk_proj", "atk_speed",
+          "atk_life", "act_cy", "act_flags", "act_hitstop", "act_invuln",
+          "act_init_entity", "act_hp", "depth_y_min"), _check_projectile),
+        ("移動の強弱（歩きと小走り）",
+         ("act_vel", "act_buf_atk", "act_pad_ignore", "act_init_entity",
+          "depth_y_min", "depth_y_max", "act_face"), _check_run),
         ("効果スプライト（斬りと衝撃）",
          ("act_start_attack", "act_attack_step", "fx_life", "fx_tile", "fx_update",
           "fx_clear_all", "atk_active", "act_hit_scan", "act_face", "act_step",
@@ -505,3 +539,624 @@ def _check_effects(rom_path, labels, r):
         r.check("ACT_SHOW_IMPACT=0 なので衝撃の効果は出ない",
                 D["SPR_TILE_IMPACT"] not in [t for t, _ in hit_fx],
                 "衝撃を切ってあるのに出ている（%s）" % hit_fx)
+
+
+# ==========================================================================
+# 避けられる攻撃 —— **仮説の本体**
+# ==========================================================================
+def _attack_row(a, ent):
+    """その者がいま振っている技表の行（combat.s の act_row_for と同じ引き方）。
+
+    行 = 技構成の先頭（act_mset_base）+ 段数 - 1。**行番号を焼き付けない。**
+    敵の近接が何行目かは action_params.inc の ATK_ROW_* が決めることであり、
+    技構成が増えれば動く。
+    """
+    mset = a.get("act_mset", ent)
+    return a.rom("act_mset_base", mset) + a.get("act_step", ent) - 1
+
+
+def _check_dodge(rom_path, labels, r):
+    """敵の攻撃が**避けられる**こと。P1 の受入で主が出した仮説そのものである。
+
+    「予備動作を見てから奥／手前へ歩けば当たらない」——これが成り立たなければ、
+    奥行きを連続にした意味も（ADR-0009）、敵の技表を分離して予備動作を延ばした意味も
+    消える。**当たり判定が出たフレームの足元Yの差だけで当否が決まる**ことを見る。
+
+    **ACT_ENEMY_TELL を変えても落ちない形にしてある**（主が真っ先に回すノブである）。
+    予備動作の長さは技表（ROM の atk_startup）から読み、歩ける距離はそこから計算する。
+    予備動作を短くすると「避けられなくなる」のは仕様どおりの帰結なので、
+    そのときは避けられることを要求する検証の方が**前提ごと**降りる（名前にそう出る）。
+
+    進め方は「操作キャラの1フレーム（action_update_player）」と
+    「敵の1フレーム（act_update_actor）」を直接呼ぶ形にしてある。
+    敵の AI に振らせると、いつ振るかが ai 側のノブ（atk_gap）で変わってしまい、
+    action の主張を見ているつもりで ai を見ることになる。
+    入力は act_pad（入力ゲートを通った後の**実効のパッド状態**）に直接置く。
+    """
+    r.section("敵の攻撃が避けられる（予備動作の間に奥へ歩く / 仮説の本体）")
+
+    a = Actors(rom_path, labels)
+    tol = _tol_pair(_tol_table(a.nes, labels), 0, 0)
+    depth_lo = a.get("depth_y_min")
+    depth_hi = a.get("depth_y_max")
+    y = depth_hi - 2                      # 手前端。ここから奥いっぱいに逃げられる
+    px = 80
+    hurt_w = a.rom("act_hurt_w", 0)
+
+    def one(press):
+        """敵に1発振らせる。press なら被弾側は予備動作の間ずっと奥へ歩く。"""
+        a.sleep_all()
+        a.stand(a.enemy, px, y)
+        a.call("act_init_entity", x=a.enemy)
+        a.put("act_face", a.enemy, 0)                  # 右を向く＝被弾側の側
+        a.call("act_start_attack", a=1, x=a.enemy)
+        row = _attack_row(a, a.enemy)
+        reach = a.rom("atk_reach", row)
+        a.stand(a.player, px + hurt_w + reach + 1, y)  # 攻撃矩形の中に立たせる
+        a.call("act_init_entity", x=a.player)
+        a.put("act_hp", a.player, 99)
+
+        tell = a.rom("atk_startup", row)
+        limit = tell + a.rom("atk_active", row) + 4
+        hp0 = a.get("act_hp", a.player)
+        ys, scan_dy = [a.get("ent_y", a.player)], []
+        for _ in range(limit):
+            a.put("act_pad", 0, D["PAD_UP"] if press else 0)
+            a.call("action_update_player")
+            ys.append(a.get("ent_y", a.player))
+            judging = (a.get("ent_state", a.enemy) == D["ACT_ST_ATK_ACTIVE"]
+                       and not a.get("act_flags", a.enemy) & D["ACT_F_HIT"])
+            dy = abs(a.get("ent_y", a.player) - a.get("ent_y", a.enemy))
+            a.call("act_update_actor", x=a.enemy)
+            if judging:
+                scan_dy.append(dy)
+        a.put("act_pad", 0, 0)
+        return {"hit": a.get("act_hp", a.player) < hp0, "dy": scan_dy,
+                "ys": ys, "tell": tell, "row": row}
+
+    stay = one(False)
+    dodge = one(True)
+
+    # --- 前提: 振りかぶっている相手の前でも、被弾側は奥へ歩ける ---
+    tell = stay["tell"]
+    walked = dodge["ys"][0] - dodge["ys"][tell]
+    want_walk = min(tell * D["ACT_DEPTH_SPEED"] // 16, dodge["ys"][0] - depth_lo)
+    r.check("敵が振りかぶっている %d フレームの間に、被弾側は奥へ %d ドット歩ける"
+            % (tell, want_walk), walked == want_walk,
+            "足元Y %d → %d（%d ドット）。予備動作 %d フレーム × 奥行きの速さ "
+            "ACT_DEPTH_SPEED=%d/16 ドットなら %d ドット動けるはずである（帯の奥端は %d）。"
+            "動けないなら、振りかぶられた側が動けない＝**避ける遊びが成立しない**"
+            % (dodge["ys"][0], dodge["ys"][tell], walked, tell,
+               D["ACT_DEPTH_SPEED"], want_walk, depth_lo))
+
+    # --- 空振り防止: 動かなければ当たる場である ---
+    r.check("その場に立ち続ければ当たる（この検証が空振りでない）", stay["hit"],
+            "奥行きも横も合わせて立たせたのに当たらなかった（判定の出たフレームの"
+            "足元Yの差 %s / 許容幅 %d、技表の行 %d）。当たらない場で「避けられた」と"
+            "言っても何も確かめていない" % (stay["dy"], tol, stay["row"]))
+
+    # --- 本題: 当否は「判定が出たフレームの足元Yの差」だけで決まる ---
+    bad = []
+    for name, run in (("その場に立った", stay), ("奥へ歩いた", dodge)):
+        reach = min(run["dy"]) if run["dy"] else None
+        want = reach is not None and reach <= tol
+        if run["hit"] != want:
+            bad.append("%s側が %s（判定の出たフレームの足元Yの差は %s、許容幅 %d）"
+                       % (name, "当たった" if run["hit"] else "当たらなかった",
+                          run["dy"], tol))
+    r.check("当たるかどうかが、判定の出たフレームの足元Yの差（許容幅 %d）だけで決まる" % tol,
+            not bad,
+            "%s。予備動作の間にどれだけ動いたかではなく、**判定が出た瞬間の奥行き**で"
+            "決まるのが ADR-0009 の当たり判定である。ここがずれるなら、"
+            "act_hit_scan が判定フレーム以外で当てているか、"
+            "commit した足元Y（act_cy）ではなく現在位置で判定している"
+            % "／".join(bad))
+
+    # --- 予備動作が「避けられる長さ」であること（ノブの帰結。前提ごと名前に出す）---
+    escapable = want_walk > tol
+    r.check("予備動作 %d フレームで %d ドット逃げられ、許容幅 %d を超える＝この一撃は避けられる"
+            % (tell, want_walk, tol) if escapable else
+            "予備動作 %d フレームでは許容幅 %d の外へ出られない設定である"
+            "（ACT_ENEMY_TELL / ACT_DEPTH_SPEED のノブの帰結。避けられないのが仕様）"
+            % (tell, tol),
+            (not dodge["hit"]) if escapable else True,
+            "予備動作の間に奥へ %d ドット歩いて許容幅 %d の外に出たのに当たった"
+            "（判定フレームの足元Yの差 %s）。**これが主の仮説の本体である**: "
+            "「予備動作を見てから避けられる」が成り立たないなら、奥行きを連続にした意味も"
+            "（ADR-0009）、敵の技表を分けて予備動作を延ばした意味も無い"
+            % (walked, tol, dodge["dy"]))
+
+
+# ==========================================================================
+# commit（振り始めに狙いを固定する）とノックバック
+# ==========================================================================
+def _check_commit(rom_path, labels, r):
+    """溜めている間に追尾しないこと。**これが壊れると仮説そのものが死ぬ。**
+
+    踏み込んで避けたのに当たり判定が付いてきたら、予備動作を長くした意味が消える。
+    commit の実体は act_start_attack が写す act_cy（狙う足元Y）と ACT_F_CFACE（向き）で、
+    攻撃中の毎フレーム act_commit_hold がそれを書き戻す。
+
+    **ノックバックだけは根の門（act_can_move）を通らない。**
+    殴られたら攻撃中でも吹き飛ぶ。ここを塞ぐと、振りかぶった敵が殴られても微動だにしない。
+    """
+    r.section("commit（溜め中に追尾しない）とノックバック（門を通らない）")
+
+    a = Actors(rom_path, labels)
+    tol = _tol_pair(_tol_table(a.nes, labels), 0, 0)
+    y = a.get("depth_y_min") + 20
+    px = 80
+    hurt_w = a.rom("act_hurt_w", 0)
+
+    def wind_up(drag_y=None, drag_face=False, target_y=None):
+        """敵に1発振らせ、予備動作の途中で足元Yか向きを**外から**動かしてみる。
+
+        drag_y    … 溜め中に攻撃側の足元Yを動かす先（None なら動かさない）
+        drag_face … 溜め中に攻撃側の向きを裏返す
+        target_y  … 標的を置く足元Y
+        戻り: (当たったか, 判定フレームの攻撃側の足元Y, 判定フレームの向き)
+
+        **奥行きと向きは別々に動かす。**両方いっぺんに動かすと、commit が壊れても
+        「向きが変わって空振りした」ために当たらず、検証が素通りする。
+        """
+        a.sleep_all()
+        a.stand(a.enemy, px, y)
+        a.call("act_init_entity", x=a.enemy)
+        a.put("act_face", a.enemy, 0)
+        a.call("act_start_attack", a=1, x=a.enemy)
+        row = _attack_row(a, a.enemy)
+        a.stand(a.player, px + hurt_w + a.rom("atk_reach", row) + 1,
+                y if target_y is None else target_y)
+        a.call("act_init_entity", x=a.player)
+        a.put("act_hp", a.player, 99)
+        hp0 = a.get("act_hp", a.player)
+
+        tell = a.rom("atk_startup", row)
+        for i in range(tell + a.rom("atk_active", row) + 2):
+            if i == tell // 2:
+                if drag_y is not None:
+                    a.put("ent_y", a.enemy, drag_y)     # 誰かが奥行きに手を出した
+                if drag_face:
+                    a.put("act_face", a.enemy, 1)       # 誰かが向きを変えた
+            a.call("act_update_actor", x=a.enemy)
+        return (a.get("act_hp", a.player) < hp0,
+                a.get("ent_y", a.enemy), a.get("act_face", a.enemy))
+
+    # --- 1. 振り始めに狙いが写される ---
+    a.sleep_all()
+    a.stand(a.enemy, px, y)
+    a.call("act_init_entity", x=a.enemy)
+    a.call("act_start_attack", a=1, x=a.enemy)
+    r.check("振り始めに、狙う足元Y（act_cy）と向き（ACT_F_CFACE）が写される",
+            a.get("act_cy", a.enemy) == y
+            and bool(a.get("act_flags", a.enemy) & D["ACT_F_CFACE"]) == bool(a.get("act_face", a.enemy)),
+            "act_cy=%d（立っている足元Yは %d）/ act_flags=$%02X・act_face=%d。"
+            "振り始めの位置と向きを写していないと、溜めている間の追尾を止めようがない"
+            % (a.get("act_cy", a.enemy), y, a.get("act_flags", a.enemy),
+               a.get("act_face", a.enemy)))
+
+    # --- 2. 溜め中に動かされても、振りは振り始めの位置・向きに出る ---
+    far = y + tol + 1
+    hit_ctrl, y_ctrl, face_ctrl = wind_up()
+    hit_dragy, y_drag, _ = wind_up(drag_y=far, target_y=far)
+    hit_dragf, _, face_drag = wind_up(drag_face=True)
+    r.check("溜め中に足元Yと向きを動かしても、判定のフレームには振り始めの値に戻っている",
+            y_drag == y and face_drag == 0,
+            "足元Yを %d へ動かしたら判定のフレームで %d（振り始めは %d）、"
+            "向きを 1 へ動かしたら %d（振り始めは 0）だった。act_commit_hold が act_cy と "
+            "ACT_F_CFACE を書き戻していない。**commit が崩れると避ける遊びが丸ごと崩れる**"
+            % (far, y_drag, y, face_drag))
+    r.check("振り始めの奥行きに立っている標的には当たる（commit の対照）", hit_ctrl,
+            "振り始めの足元Y %d に標的を置いたのに当たらなかった。"
+            "この対照が当たらないと、下の「追尾しない」は何も確かめていない" % y)
+    r.check("溜め中に攻撃側を標的ごと %d ドット動かしても、振りは振り始めの奥行きに出る"
+            "（追尾しない）" % (tol + 1), not hit_dragy,
+            "攻撃側と標的をそろって足元Y %d へ動かしたのに当たった（振り始めは %d）。"
+            "**溜めている間に狙いが付いてきている**＝踏み込んで避けても当たるということで、"
+            "予備動作を長くした意味が消える（仮説そのものが死ぬ）" % (far, y))
+    r.check("溜め中に向きを裏返されても、振りは振り始めの向きに出る（標的に当たる）",
+            hit_dragf,
+            "溜めている途中で向きだけを裏返したら、振り始めの側に居た標的に当たらなくなった。"
+            "向きも commit の一部である（ACT_F_CFACE）。ここが崩れると、"
+            "予備動作を見て回り込んだのに背中から殴られる／その逆が起きる")
+
+    # --- 3. 攻撃中は自分の足で動けない（根が生える）---
+    a.sleep_all()
+    a.stand(a.enemy, px, y)
+    a.call("act_init_entity", x=a.enemy)
+    a.call("act_start_attack", a=1, x=a.enemy)
+    a.put("act_px", 0, 4)
+    a.call("act_move_right", x=a.enemy)
+    rooted = a.x(a.enemy) == px
+    if D["ACT_ATTACK_ROOT"]:
+        r.check("攻撃の間は自分の足で動けない（ACT_ATTACK_ROOT=1。その場に根が生える）",
+                rooted,
+                "攻撃中に act_move_right で %d → %d と動いた。予備動作の間に踏み込めると、"
+                "当たる位置も一緒に動く（commit の一部である）" % (px, a.x(a.enemy)))
+    else:
+        r.check("ACT_ATTACK_ROOT=0 の設定では攻撃中でも自分の足で動ける", not rooted,
+                "ノブが 0（根が生えない）なのに攻撃中に動けなかった（%d のまま）" % px)
+
+    # --- 4. ノックバックは根の門を通らない ---
+    kb = 5
+    a.put("act_kb", a.enemy, kb)
+    a.put("act_hitstop", a.enemy, 0)
+    before = a.x(a.enemy)
+    a.call("act_update_actor", x=a.enemy)
+    moved = a.x(a.enemy) - before
+    r.check("殴られたら攻撃中でも吹き飛ぶ（ノックバックは根の門 act_can_move を通らない）",
+            moved == kb,
+            "攻撃中（ent_state=%d）にノックバック速度 %d を乗せて1フレーム進めたら "
+            "%d ドットしか動かなかった。ノックバックは「自分の足で動く」ことではないので"
+            "act_shift_* を直に呼ぶのが約束である（actor.s の act_knockback_step）。"
+            "ここを門に通すと、振りかぶった敵を殴っても微動だにしない"
+            % (a.get("ent_state", a.enemy), kb, moved))
+
+    # --- 5. ノックバックの向きは殴った側の向きから来る（公の経路）---
+    signs = []
+    for kb_dir, want in ((0, +1), (1, -1)):
+        a.sleep_all()
+        a.stand(a.player, px, y)
+        a.call("act_init_entity", x=a.player)
+        a.put("act_hp", a.player, 99)
+        a.put("act_atk_ent", 0, a.player)
+        a.put("act_kb_dir", 0, kb_dir)
+        a.put("act_kb_amt", 0, kb)
+        a.call("act_damage", a=1, x=a.player)
+        got = a.get("act_kb", a.player)
+        got = got - 256 if got > 127 else got
+        if got != want * kb:
+            signs.append("act_kb_dir=%d → act_kb=%d（期待 %d）" % (kb_dir, got, want * kb))
+    r.check("ノックバックの向きは殴った側の向き（act_kb_dir）で決まる", not signs,
+            "%s。向きの符号が逆だと、殴られた相手が**殴った側へ吸い込まれる**"
+            % "／".join(signs))
+
+
+# ==========================================================================
+# 飛び道具 —— 出る・飛ぶ・当たる・味方には当たらない・寿命で消える
+# ==========================================================================
+def _check_projectile(rom_path, labels, r):
+    """弾がエンティティとして成立していること。
+
+    弾は短命の効果（fx）ではなく**本物のエンティティ**である（当たり判定を持ち、
+    OAM の並べ替えに乗る）。その代わり、出しっぱなしで枠を食い潰す・味方討ちをする・
+    見えないのに当たる、といった壊れ方をしうる。ここで全部塞ぐ。
+
+    速さ・寿命・威力・大きさは**技表（ROM の atk_* の ATK_ROW_BULLET 行）から読む**。
+    主がそこを触ってもこの検証は落ちない。
+    """
+    r.section("飛び道具（出る・飛ぶ・当たる・味方には当たらない・寿命で消える）")
+
+    a = Actors(rom_path, labels)
+    free, ents = D["ENT_FREE_FIRST"], D["MAX_ENTITIES"]
+    y = a.get("depth_y_min") + 20
+    px = 48
+
+    def fire(shooter):
+        """shooter に遠隔の技構成で1発撃たせ、出た弾の番号を返す（出なければ None）。"""
+        a.stand(shooter, px, y)
+        a.call("act_init_entity", x=shooter)
+        a.put("act_mset", shooter, D["ACT_MSET_SHOOT"])
+        a.put("act_face", shooter, 0)                 # 右へ撃つ
+        a.call("act_start_attack", a=1, x=shooter)
+        row = _attack_row(a, shooter)
+        for _ in range(a.rom("atk_startup", row) + 2):
+            a.call("act_update_actor", x=shooter)
+            live = [i for i in range(free, ents) if a.get("ent_active", i)]
+            if live:
+                return live[0]
+        return None
+
+    def clear_free():
+        for i in range(free, ents):
+            a.put("ent_active", i, 0)
+            a.put("act_flags", i, 0)
+
+    # --- 1. 出る ---
+    a.sleep_all()
+    clear_free()
+    shooter = a.enemy
+    proj = fire(shooter)
+    if not r.check("遠隔の技構成（ACT_MSET_SHOOT）で振ると、空き枠に弾が1つ出る",
+                   proj is not None,
+                   "振りかぶりの発生 %d フレームを過ぎても空き枠（%d..%d）に弾が出ない。"
+                   "act_attack_step が atk_proj の行を見て act_proj_fire を呼んでいない、"
+                   "または空き枠を見つけられていない（ent_find_free）"
+                   % (a.rom("atk_startup", D["ATK_ROW_SHOOT"]), free, ents - 1)):
+        return
+
+    bullet_row = a.rom("atk_proj", _attack_row(a, shooter))
+    speed = a.rom("atk_speed", bullet_row)
+    life = a.rom("atk_life", bullet_row)
+    born_x = a.x(proj)
+    facts = []
+    if not a.get("act_flags", proj) & D["ACT_F_PROJ"]:
+        facts.append("飛び道具の印 ACT_F_PROJ が立っていない（act_flags=$%02X）"
+                     % a.get("act_flags", proj))
+    if a.get("ent_y", proj) != a.get("act_cy", shooter):
+        facts.append("弾の足元Yが %d（撃った主が commit した足元Y は %d）"
+                     % (a.get("ent_y", proj), a.get("act_cy", shooter)))
+    if a.get("act_proj_owner", proj - free) != shooter:
+        facts.append("撃った主が %d と記録されている（本当は %d）"
+                     % (a.get("act_proj_owner", proj - free), shooter))
+    if a.get("act_hitstop", proj) != D["ACT_PROJ_ARM"]:
+        facts.append("出たフレームの据え置きが %d（ACT_PROJ_ARM=%d）"
+                     % (a.get("act_hitstop", proj), D["ACT_PROJ_ARM"]))
+    r.check("出た弾が、撃った主の commit した奥行き・向き・持ち主を引き継ぐ", not facts,
+            "%s。弾の奥行きが撃った主の**現在位置**から来ると、溜め中に動かされた分だけ"
+            "狙いがずれる。持ち主が違うと、狙う区画（act_target_range）が逆になって"
+            "**味方討ち**になる" % "／".join(facts))
+
+    # --- 2. 生まれたフレームには当たらない（**見えない判定を作らない**）---
+    # 銃口に重なって立っている相手を置く。ここで即座にダメージが入るなら、
+    # 弾は**画面に一度も出ないまま**当てたことになる（ADR-0002 が最も理不尽としたもの）。
+    a.stand(a.player, a.x(proj), a.get("ent_y", proj))
+    a.call("act_init_entity", x=a.player)
+    a.put("act_hp", a.player, 99)
+    a.put("act_invuln", a.player, 0)
+    hp0 = a.get("act_hp", a.player)
+    a.call("act_proj_update")
+    r.check("銃口に重なって立っていても、弾が生まれた最初のフレームには当たらない"
+            "（必ず1フレームは画面に出る / ACT_PROJ_ARM=%d）" % D["ACT_PROJ_ARM"],
+            a.get("act_hp", a.player) == hp0 and a.get("ent_active", proj),
+            "1回目の進行でいきなり %d ダメージ入った（弾はまだ %s）。"
+            "ACT_PROJ_ARM が 0 だと、至近で撃たれた弾は出たその瞬間に当たって消え、"
+            "**当たり判定があるのに絵が一度も出ない**。銃口に1フレーム留めること"
+            % (hp0 - a.get("act_hp", a.player),
+               "居る" if a.get("ent_active", proj) else "消えている"))
+    landed = None
+    for i in range(4):
+        a.call("act_proj_update")
+        if a.get("act_hp", a.player) < hp0:
+            landed = i + 2
+            break
+    r.check("留まっていた弾は、その後ちゃんと当たる（この検証が空振りでない）",
+            landed is not None,
+            "銃口に重ねた相手に %d フレーム進めても当たらなかった。"
+            "当たらない場で「最初のフレームには当たらない」と言っても何も確かめていない" % 5)
+
+    # --- 3. 飛ぶ（速さは技表どおり）---
+    a.sleep_all()
+    clear_free()
+    proj = fire(a.enemy)
+    if proj is None:
+        return
+    born_x = a.x(proj)
+    for _ in range(D["ACT_PROJ_ARM"]):
+        a.call("act_proj_update")
+    FLY = 8
+    for _ in range(FLY):
+        a.call("act_proj_update")
+    want = FLY * speed // 16
+    r.check("弾が技表の速さ（atk_speed=%d/16 ドット/f）で飛ぶ" % speed,
+            a.x(proj) - born_x == want,
+            "%d フレームで %d ドット進んだ（期待 %d）。速さは技表の "
+            "ATK_ROW_BULLET 行（atk_speed）が決める。端数（act_sub）の持ち越しが"
+            "壊れていると、ここがずれる" % (FLY, a.x(proj) - born_x, want))
+
+    # --- 4. 寿命で消える（外れた弾が枠に残り続けない）---
+    died = None
+    for i in range(life + 4):
+        a.call("act_proj_update")
+        if not a.get("ent_active", proj):
+            died = FLY + i + 1
+            break
+    r.check("誰にも当たらなかった弾が寿命（atk_life=%d フレーム）で消える" % life,
+            died == life,
+            "弾が %s（期待は飛び始めてから %d フレーム目）。消えないと空き枠が %d 個しか"
+            "無いのに埋まり続け、次の弾が**黙って出なくなる**。act_proj_step の "
+            "`dec act_timer / beq @expire` を見よ"
+            % ("%d フレーム目に消えた" % died if died else "消えなかった",
+               life, D["ENT_FREE_COUNT"]))
+    r.check("消えた弾の枠は飛び道具の印（ACT_F_PROJ）ごと返る（次の弾が使える）",
+            not a.get("act_flags", proj) & D["ACT_F_PROJ"],
+            "act_flags=$%02X のまま。印が残った枠を別の用途（P2 のアイテム）が使うと、"
+            "act_proj_update がそれを弾として飛ばす" % a.get("act_flags", proj))
+
+    # --- 5. 当たる / 撃った主の味方には当たらない ---
+    def shoot_at(victim_slot, distance):
+        a.sleep_all()
+        clear_free()
+        p = fire(a.enemy)
+        if p is None:
+            return None
+        a.stand(victim_slot, a.x(p) + distance, y)
+        a.call("act_init_entity", x=victim_slot)
+        a.put("act_hp", victim_slot, 99)
+        a.put("act_invuln", victim_slot, 0)
+        hp0 = a.get("act_hp", victim_slot)
+        for _ in range(D["ACT_PROJ_ARM"] + life):
+            a.call("act_proj_update")
+            if a.get("act_hp", victim_slot) < hp0:
+                return ("hit", a.get("ent_active", p))
+            if not a.get("ent_active", p):
+                return ("gone", 0)
+        return ("alive", 1)
+
+    span = max(1, speed // 16)
+    got = shoot_at(a.player, span * 6)
+    r.check("撃った主の**相手**（敵 → 操作キャラ）には当たり、当たった弾は消える",
+            got is not None and got[0] == "hit" and not got[1],
+            "弾を %d ドット先の操作キャラへ飛ばしたら %s。"
+            "当たらないなら act_build_proj_rect か act_scan_targets が狙う区画を"
+            "間違えている。当たって消えないなら弾が貫通している（枠も返らない）"
+            % (span * 6, {"hit": "当たったが消えなかった", "gone": "誰にも当たらず消えた",
+                          "alive": "飛び続けた", None: "そもそも出なかった"}
+               .get(got[0] if got else None, got)))
+
+    friend = a.enemy + 1                                 # 撃った主と同じ区画＝味方
+    got = shoot_at(friend, span * 6)
+    r.check("**撃った主の味方には当たらない**（敵の弾が敵を撃たない）",
+            got is not None and got[0] != "hit",
+            "同じ敵区画の #%d を %d ドット先に置いたら弾が当たった。"
+            "狙う区画は act_target_range が act_proj_owner（撃った主）から決める。"
+            "ここが弾自身の番号（空き枠 = 敵区画より後ろ）で決まると、"
+            "**敵の弾が敵に当たる**（味方討ち）" % (friend, span * 6))
+
+
+# ==========================================================================
+# 移動の強弱 —— 歩きと小走り（速さには代償がある）
+# ==========================================================================
+def _check_run(rom_path, labels, r):
+    """小走りの**3つの代償**と、「歩く速さ以下では今までと同じ」こと。
+
+    主の提案は「小走りになる、ダッシュする、といった動きのバリエーション」だが、
+    速いだけの選択肢は選択にならない。action-dev は速さと引き換えに3つを失う形にした
+    （action_params.inc §2-a）:
+
+        代償1 向きを変えにくい … 歩く速さ以下に落ちるまで向きが変わらない
+        代償2 攻撃に移れない   … 同上。ただし**先行入力は捨てない**
+        代償3 奥行きが鈍る     … 走っている間だけ上下が遅い
+
+    もう一つ、**主が実機で承認した手触りを壊していないこと**も同じ重さで縛る。
+    歩く速さ以下では、押した瞬間に歩き出し・離した瞬間に止まり・逆を押せばその場で
+    振り向く。ここに慣性が漏れ出したら、それは承認された手触りの変更である。
+
+    期待値はすべて action_params.inc のノブから計算する（ACT_RUN_SPEED を変えても
+    落ちない）。走りを丸ごと切った設定（ACT_RUN_ENABLE = 0）では、
+    **主張の形の方が変わる**（B を押しても歩きのままであること）。
+    """
+    r.section("移動の強弱（歩き / 小走りの3つの代償。ノブは action_params.inc）")
+
+    walk, run = D["ACT_MOVE_SPEED"], D["ACT_RUN_SPEED"]
+    a = Actors(rom_path, labels)
+    y = (a.get("depth_y_min") + a.get("depth_y_max")) // 2
+    a.sleep_all()
+
+    def rest(x0=48):
+        a.nes.set_buttons(set())
+        step_frame(a.nes, labels, 1)
+        a.stand(a.player, x0, y)
+        a.call("act_init_entity", x=a.player)
+        for name in ("act_buf_atk", "act_pad_ignore"):
+            if name in labels:
+                a.put(name, 0, 0)
+        return x0
+
+    def watch(s):
+        return (s.x(s.player), _sgn8(s.get("act_vel", s.player)),
+                s.get("act_face", s.player), s.get("ent_state", s.player),
+                s.get("ent_y", s.player), s.get("act_buf_atk", 0))
+
+    # ---------------- 歩き（主が承認した手触り。ここは変わっていないこと）----------------
+    N = 16
+    x0 = rest()
+    rows = a.hold({"RIGHT"}, N, watch)
+    want = N * walk // 16
+    r.check("歩きは %d フレームで %d ドット進む（ACT_MOVE_SPEED=%d/16 ドット/f）"
+            % (N, want, walk), rows[-1][0] - x0 == want and rows[0][1] == walk,
+            "%d ドット進み、1フレーム目の速さは %d だった（期待 %d ドット / 速さ %d）。"
+            "歩きは押した**そのフレーム**から歩く速さで動くのが約束である"
+            "（慣性が働くのは歩く速さを超えている間だけ）"
+            % (rows[-1][0] - x0, rows[0][1], want, walk))
+
+    stop = a.hold(set(), 2, watch)
+    r.check("方向を離した次のフレームに止まる（歩く速さからの慣性は無い）",
+            stop[0][0] == stop[1][0] == rows[-1][0] and stop[1][1] == 0,
+            "離した後も %d → %d → %d と滑った（速さ %d）。歩く速さ以下は即停止が"
+            "**主の承認した手触り**である。ここに慣性が漏れると、小走りの代償ではなく"
+            "歩きそのものが変わる" % (rows[-1][0], stop[0][0], stop[1][0], stop[1][1]))
+
+    rest()
+    turn = a.hold({"LEFT"}, 1, watch)
+    r.check("歩く速さでは、逆を押したその場で振り向く（代償が出るのは小走り中だけ）",
+            turn[0][2] == 1 and turn[0][1] == -walk,
+            "1フレーム押して 向き=%d / 速さ=%d（期待 向き=1 / 速さ=%d）。"
+            "止まっている所から逆を押したときまで向きが変わらないなら、"
+            "それは代償ではなく操作不能である" % (turn[0][2], turn[0][1], -walk))
+
+    # ---------------- 走りを切ってある設定では、ここで主張の形が変わる ----------------
+    if not D["ACT_RUN_ENABLE"]:
+        rest()
+        rows = a.hold({"B", "RIGHT"}, N, watch)
+        r.check("ACT_RUN_ENABLE=0 では B を押しても歩きのままである",
+                all(v == walk for _, v, _, _, _, _ in rows),
+                "B を押しながら歩いたら速さが %s になった。走りを切った設定なので"
+                "歩く速さ（%d）から変わってはならない"
+                % (sorted({v for _, v, _, _, _, _ in rows}), walk))
+        return
+
+    # ---------------- 小走り: 加速 ----------------
+    accel = D["ACT_RUN_ACCEL"]
+    ramp = _ceil_div(run - walk, accel) + 2
+    x0 = rest()
+    rows = a.hold({"B", "RIGHT"}, ramp, watch)
+    vels = [v for _, v, _, _, _, _ in rows]
+    want_vels = [min(run, walk + i * accel) for i in range(ramp)]
+    r.check("B を押しながら走ると、歩く速さ %d から %d/16 ドット/f ずつ最高速 %d まで上がる"
+            % (walk, accel, run), vels == want_vels,
+            "速さの推移が %s（期待 %s）。走り出しは**歩く速さから**であり"
+            "（いきなり最高速だと「小走りになる」過程が消える）、"
+            "上限は ACT_RUN_SPEED=%d で頭打ちになること" % (vels, want_vels, run))
+    r.check("小走りは歩きより速く進む（%d フレームで %d ドット > 歩きの %d ドット）"
+            % (ramp, rows[-1][0] - x0, ramp * walk // 16),
+            rows[-1][0] - x0 > ramp * walk // 16,
+            "%d フレームで %d ドット。歩けば %d ドットなので、速くなっていない"
+            % (ramp, rows[-1][0] - x0, ramp * walk // 16))
+
+    # ---------------- 代償1: 向きを変えにくい ----------------
+    turn_vel, brake = D["ACT_TURN_VEL"], D["ACT_RUN_TURN_BRAKE"]
+    want_slide = _ceil_div(run - turn_vel, brake)
+    rows = a.hold({"B", "LEFT"}, want_slide + 4, watch)
+    slide = next((i for i, row in enumerate(rows) if row[2] == 1), None)
+    slid_back = [i for i in range(1, len(rows))
+                 if rows[i][2] == 0 and rows[i][0] < rows[i - 1][0]]
+    r.check("代償1: 最高速から逆を押しても、歩く速さ %d まで落ちるまで向きが変わらない"
+            "（%d フレーム滑る）" % (turn_vel, want_slide),
+            slide == want_slide and not slid_back,
+            "向きが変わったのは %s フレーム目（期待 %d = (最高速 %d - %d) / 減速 %d）、"
+            "滑っている間に後ろへ動いたフレーム %s。逆を押した瞬間に向きが変われば"
+            "**速いだけで代償が無い**ことになる（ACT_TURN_VEL を ACT_RUN_SPEED まで"
+            "上げるとそうなる。それは仕様変更である）"
+            % (slide, want_slide, run, turn_vel, brake, slid_back))
+
+    # ---------------- 代償2: 攻撃に移れない。ただし先行入力は捨てない ----------------
+    atk_vel = D["ACT_ATK_VEL"]
+    rest()
+    a.hold({"B", "RIGHT"}, ramp)
+    rows = a.hold({"B", "RIGHT", "A"}, 1, watch)
+    rows += a.hold({"B", "RIGHT"}, D["ACT_BUF_FRAMES"] + 2, watch)
+    swung = next((i for i, row in enumerate(rows) if row[3] == D["ACT_ST_ATK_START"]), None)
+    too_fast = [i for i, row in enumerate(rows)
+                if row[3] == D["ACT_ST_ATK_START"] and abs(rows[i - 1][1]) > atk_vel]
+    dropped = swung is not None and any(row[5] == 0 and row[3] != D["ACT_ST_ATK_START"]
+                                        for row in rows[:swung])
+    r.check("代償2: 走っている間は振れないが、先行入力は捨てずに %d フレーム以内に出る"
+            % D["ACT_BUF_FRAMES"],
+            swung is not None and swung > 0 and not too_fast and not dropped,
+            "Aを押してから %s フレーム目に振った（速さが %d 以下に落ちる前に振った"
+            "フレーム %s / 先行入力を落としたか %s）。**先行入力は捨てない**のが規約で、"
+            "捨てると「押したのに出ない」になる。すぐ振れると代償2 が消える"
+            % (swung, atk_vel, too_fast, dropped))
+
+    # ---------------- 代償3: 奥行きが鈍る ----------------
+    DN = 16
+    rest()
+    y_start = a.get("ent_y", a.player)
+    rows = a.hold({"UP"}, DN, watch)
+    walked_depth = y_start - rows[-1][4]
+    want_walk_depth = DN * D["ACT_DEPTH_SPEED"] // 16
+    rest()
+    a.hold({"B", "RIGHT"}, ramp)
+    y_start = a.get("ent_y", a.player)
+    rows = a.hold({"B", "RIGHT", "UP"}, DN, watch)
+    ran_depth = y_start - rows[-1][4]
+    want_run_depth = DN * D["ACT_RUN_DEPTH_SPEED"] // 16
+    r.check("代償3: 歩きながらなら %d フレームで奥へ %d ドット、走りながらだと %d ドット"
+            % (DN, want_walk_depth, want_run_depth),
+            walked_depth == want_walk_depth and ran_depth == want_run_depth,
+            "歩き %d ドット（期待 %d / ACT_DEPTH_SPEED=%d）、走り %d ドット"
+            "（期待 %d / ACT_RUN_DEPTH_SPEED=%d）。横に速い代わりに縦の回避は歩いた方が"
+            "速い、というのが代償3 である。**予備動作を見てから奥へ避けるなら"
+            "走るのをやめる判断が要る**。同じ値にすると代償が消える"
+            % (walked_depth, want_walk_depth, D["ACT_DEPTH_SPEED"],
+               ran_depth, want_run_depth, D["ACT_RUN_DEPTH_SPEED"]))
+    a.nes.set_buttons(set())
+
+
+def _sgn8(v):
+    return v - 256 if v > 127 else v
+
+
+def _ceil_div(a, b):
+    return -(-a // max(1, b))

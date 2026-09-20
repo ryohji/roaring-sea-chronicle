@@ -23,7 +23,7 @@ from cpu6502 import CpuCrash                        # noqa: E402
 from nes import Nes, boot, frame_end, step_frame    # noqa: E402
 from scene import disarm_enemies, slot_ranges       # noqa: E402
 from gate import Gate, run_sections, boot_or_fail   # noqa: E402
-from srcdefs import action_defs                     # noqa: E402
+from srcdefs import action_defs, ai_defs            # noqa: E402
 
 TSV_PATH = os.path.join(os.path.dirname(HERE), "data", "ai_params.tsv")
 
@@ -31,8 +31,11 @@ TSV_PATH = os.path.join(os.path.dirname(HERE), "data", "ai_params.tsv")
 # id と name は表に出ない（id は添字そのもの、name は roster から引くための識別子）。
 # **レーンは ADR-0009 で廃止した。** lane_hold（次にレーンを移れるまでの待ちフレーム数）は
 # depth_spd（奥行きの寄り足の速さ）に意味ごと変わっている（TSV の列の説明を見よ）。
+# **列を足したらここにも足すこと。**この並びが「TSV と ai_params.s の写しを
+# 突き合わせる列」そのものであり、ここに無い列は写し間違いを誰も見張っていない。
 PARAM_COLUMNS = ("speed", "hold_x", "reach_x", "aggr_x",
-                 "follow_x", "leash_x", "atk_gap", "depth_spd", "item_pri")
+                 "follow_x", "leash_x", "atk_gap", "depth_spd", "item_pri",
+                 "hate", "react", "wander", "dwell")
 
 # 足場（シーンを組み立てて走らせる）に要るラベル。ここが欠けたときだけ層ごと諦める。
 CORE = ("ent_active", "ent_x_lo", "ent_x_hi", "ent_y", "ent_state", "ent_ai", "wait_nmi")
@@ -111,6 +114,20 @@ class Scene:
         self.nes.set_buttons(set())
         frame_end(self.nes, self.labels)
 
+    def trace(self, frames, watch, buttons=()):
+        """1フレームずつ進め、**そのフレームの更新が終わった点**で観測する。
+
+        hold() の戻り位置はフレームの更新の**最中**である（test/harness/nes.py 冒頭）。
+        ai_woff / ai_gap / ai_react のような作業変数はそこで書き換わる途中なので、
+        それらを読む観測にはこちらを使うこと。
+        """
+        self.nes.set_buttons(set(buttons))
+        out = []
+        for _ in range(frames):
+            step_frame(self.nes, self.labels, 1)
+            out.append(watch(self))
+        return out
+
     def settle(self, frames=1):
         self.nes.set_buttons(set())
         step_frame(self.nes, self.labels, frames)
@@ -149,6 +166,19 @@ class Scene:
         return i
 
 
+def _signed(v):
+    """8bit の符号つきの値（ai_woff など）を Python の整数にする。"""
+    return v - 256 if v > 127 else v
+
+
+def _sign(v):
+    return (v > 0) - (v < 0)
+
+
+def _ceil_div(a, b):
+    return -(-a // b)
+
+
 def _runs_of(flags):
     """True が連続した最長の長さと、合計の個数を返す。"""
     longest = current = 0
@@ -180,7 +210,11 @@ def layer2_ai(rom_path, labels, r):
          _check_not_a_wall),
         ("操作キャラのダウン",
          ("ai_sit", "act_enter_down", "action_revive"), _check_leader_down),
-        ("敵が居なくなった後の追従", ("ai_goal", "ai_gap"), _check_regroup),
+        ("敵が居なくなった後の立ち位置",
+         ("ai_goal", "ai_gap", "ai_woff", "ai_react"), _check_regroup),
+        ("ヘイト（狙われやすさ）",
+         ("ai_update", "ai_cursor", "ai_target", "ai_p_hate", "ai_p_aggr_x"),
+         _check_hate),
         ("プロファイル番号の範囲",
          ("ai_init_entity", "ai_default_profile", "ai_goal", "ai_gap"), _check_profile_range),
         ("のけぞり中の入力",
@@ -388,7 +422,22 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
     # --- 3. 仲間どうしが重ならない ---
     # P1 のシーンには仲間が1体しか居ないので、2体目を配置側と同じ手順で置いて見る
     # （パーティは操作1＋自律2。PARTY_SIZE = 3）。
-    PAIR_FRAMES = 220
+    #
+    # **観測を2段に分けてある。**
+    #   前半 … 敵が居る。2体は同じ標的に寄るので ai_spread（番号順の分散）が効く
+    #   後半 … 敵を消す。2体とも操作キャラの follow_x へ戻るので、
+    #          **同じ立ち位置を奪い合う**最悪の場になり、ai_avoid_allies が効く
+    #
+    # 後半を足したのは、この節の「空振り防止」（2体がともに生存し、奥行きが重なる位置に
+    # 居ることを十分な時間観測した）が**戦闘の終わる時刻に依存していた**からである。
+    # 敵に寄っている間、2体は別々の敵を追って別々の奥行きに居る。奥行きが重なるのは
+    # 戦闘が終わって2人とも操作キャラの所へ戻ってからで、その時刻は立ち位置の揺らぎ
+    # （wander / dwell）や速さのノブで前後する。ai-dev の報告では、揺らぎが入っただけで
+    # 重なりの観測できる時間が 71 → 35 フレームに減っている。
+    # **こちらから戦闘を終わらせれば、観測窓は位相に依らない。**
+    PAIR_ENGAGE = 220           # 敵に寄っている間（ai_spread）
+    PAIR_REGROUP = 150          # 敵が居なくなってから（ai_avoid_allies）。ここで奥行きが揃う
+    PAIR_FRAMES = PAIR_ENGAGE + PAIR_REGROUP
     pair = Scene(rom_path, labels)
     # 2体目は操作キャラを挟んで1体目の反対側に置く（1体目と同じ距離だけ右）。
     # 位置をテストに焼き付けず、シーンの配置から作る。
@@ -399,22 +448,30 @@ def _check_not_a_wall(rom_path, labels, profiles, r):
         both = s.alive(ally) and s.alive(ally2)
         return (both, s.near_depth(ally, ally2), abs(s.x(ally) - s.x(ally2)))
 
-    pair_samples = pair.hold(set(), PAIR_FRAMES, watch3)
+    pair_samples = pair.hold(set(), PAIR_ENGAGE, watch3)
+    pair.sleep(slots["enemy_first"], slots["count"])     # 戦闘を終わらせる（敵が全滅した状態）
+    pair_samples += pair.hold(set(), PAIR_REGROUP, watch3)
     pair_overlap = [(both and same and d < OVERLAP_X) for both, same, d in pair_samples]
     longest2, total2 = _runs_of(pair_overlap)
     near = [d for both, close, d in pair_samples if both and close]
-    r.check("仲間2体がともに生存して奥行きが重なる位置に居る状態を観測できた（%d フレーム）"
-            % PAIR_FRAMES, len(near) >= PAIR_FRAMES // 4,
-            "両者生存かつ奥行きが重なっていたのは %d フレーム（%d 中）。"
-            "2体目の配置（%d ドット）が遠すぎるか、片方が早々に戦線離脱している"
-            % (len(near), PAIR_FRAMES, mirror))
+    # 期待値は後半（敵を消してから）の長さで作る。前半で奥行きが重なるかどうかは
+    # 敵の配置しだいであって、この節の主張とは関係が無い。
+    want_near = PAIR_REGROUP // 2
+    r.check("仲間2体がともに生存して奥行きが重なる位置に居る状態を観測できた"
+            "（敵を消してから %d フレーム / 全 %d フレーム）" % (PAIR_REGROUP, PAIR_FRAMES),
+            len(near) >= want_near,
+            "両者生存かつ奥行きが重なっていたのは %d フレーム（%d 中、期待 %d 以上）。"
+            "2体目の配置（%d ドット）が遠すぎるか、片方が早々に戦線離脱しているか、"
+            "敵を消しても2体が操作キャラの奥行きへ戻ってきていない（追従が壊れている）"
+            % (len(near), PAIR_FRAMES, want_near, mirror))
     r.check("仲間どうしの重なり (|x差| < %d) が %d フレーム以上続かない"
             % (OVERLAP_X, OVERLAP_FRAMES_MAX + 1), longest2 <= OVERLAP_FRAMES_MAX,
             "重なりが最長 %d フレーム続いた（合計 %d フレーム / %d 中、最小の横距離 %d ドット）。"
-            "同じ標的に寄った2体が同じ座標に潰れており、1スキャンライン8スプライトの制約で"
+            "同じ立ち位置に寄った2体が同じ座標に潰れており、1スキャンライン8スプライトの制約で"
             "片方が消える。ai.s の ai_spread（番号順に AI_SPREAD ずつ後ろへずらす）が"
             "効いていないか、ai_clear_player_zone の押し出しが分散を**上書き**している"
-            "（押された仲間が、押されていない仲間の立ち位置に重なる）"
+            "（押された仲間が、押されていない仲間の立ち位置に重なる）。"
+            "揺らぎ（ai_woff）を分散より**後**に足しても同じことが起きる"
             % (longest2, total2, PAIR_FRAMES, min(near) if near else -1))
 
 
@@ -458,37 +515,210 @@ def _check_leader_down(rom_path, labels, profiles, r):
 
 # ---------------------------------------------------------------- 追従
 def _check_regroup(rom_path, labels, profiles, r):
-    """敵を全滅させた後、仲間が追従距離（follow_x）に落ち着くこと。"""
-    r.section("敵が居なくなった後の追従（follow_x）")
+    """敵が居なくなった後の立ち位置。**揺らぎ（意図）と震え（制御の失敗）を区別する。**
+
+    ここはもともと「落ち着いたら静止する」＝ 末尾のフレームの距離が1種類だけ、と
+    書いてあった。
+    だがそれは主が「やめろ」と言った挙動そのものを不変条件として固定していた:
+
+        「敵を排除し終えた後、AI キャラクターが棒立ちになるというところでも、
+          能動的に動く仲間という感じがしない」（主の指摘）
+
+    ai-dev はこれを受けて、立ち位置を -1/0/+1/+2 段に振る**揺らぎ**（TSV の
+    wander / dwell）と、歩き出しの**遅れ**（react）を入れた。仲間は何秒かに一度
+    立ち位置を引き直し、そこまで歩いて、また何秒か止まる。**動くのが正しい。**
+
+    では何を見張るのか。この節が本当に捕まえたかったのは
+    **「AI_DEADBAND = 0 による毎フレームの震え」**である（節の名前が「震えない」）。
+    揺らぎと震えは、画面でも数値でも次の3点で別物である:
+
+        揺らぎ … 引き直した瞬間にだけ行き先が変わる。そこまでの歩きは**単調**で、
+                 着いたら次の引き直しまで**1ドットも動かない**
+        震え   … 行き先は変わっていないのに**往復**する。止まっている時間が無い
+
+    したがって主張は「動くな」ではなく、次の4つである。
+    どれも wander / dwell / react / speed を振っても成立する形にしてある。
+
+      1. 引き直しと引き直しの間、歩きは**単調**である（往復しない）
+      2. 引き直しと引き直しの間に、**必ず静止する時間がある**
+      3. 落ち着いた位置が、そのとき狙っている段（ai_woff から作った ai_gap）と一致する
+      4. 揺らいでも追従距離 follow_x のまわり（-1〜+2 段）から出ない
+
+    さらに、**棒立ちに戻っていないこと**（引き直しが来て、実際に足が出ること）も
+    見る。ここが死ぬと主の指摘した不具合がそのまま戻るが、
+    tail が1種類であることを要求していた昔の形では、それが**合格**になっていた。
+    """
+    r.section("敵が居なくなった後の立ち位置（追従距離 follow_x と揺らぎ wander）")
     slots = slot_ranges(labels)
     player, ally = slots["player"], slots["ally_first"]
-    follow_x = profiles["follow_x"][0]          # 仲間（万能型）の追従距離。TSV が正本
 
-    # 立ち位置の許容誤差（AI_DEADBAND, 既定4）と1フレームの歩き幅を包む余裕。
-    # ここは「落ち着いた距離が follow_x のあたりである」ことだけを見たいので、
-    # ドット単位で一致することは求めない。
-    SETTLE_TOL = 8
-    SETTLE_FRAMES = 100
-    TAIL = 20
+    # 期待値はすべて TSV（正本）と ai_params.inc（場の規則）から作る。焼き付けない。
+    follow_x = profiles["follow_x"][0]
+    wander = profiles["wander"][0]
+    dwell = profiles["dwell"][0]
+    react = profiles["react"][0]
+    speed = profiles["speed"][0]
+    A = ai_defs()
+    deadband = A["AI_DEADBAND"]
+    jitter = A["AI_WANDER_JITTER"]
+    gap_min = A["AI_GAP_MIN"]
+    clear_x = A["AI_CLEAR_X"]           # 操作キャラの専有距離（壁にならないための場の規則）
+    goal_regroup = A["AI_GOAL_REGROUP"]
+
+    # 1フレームに進むドット数（1/16 ドット刻み）。速さを変えても空振りしない。
+    step = max(1, speed // 16 + (1 if speed % 16 else 0))
+    # 思考の順番待ち: 自律枠を AI_THINK_PER_FRAME 体ずつ巡るので、行き先が変わってから
+    # 本人が気付くまで最大これだけかかる。
+    think_lag = _ceil_div(A["ENT_FREE_FIRST"] - A["ENT_ALLY_FIRST"],
+                          max(1, A["AI_THINK_PER_FRAME"]))
+    # 引き直しで行き先が動く最大幅は -1 段 → +2 段 の 3 段ぶん。
+    travel = _ceil_div(3 * wander * 16, max(1, speed)) + 1
+    # 「引き直してから落ち着くまで」に許す長さ。これを超えて動いていたら震えている。
+    allow = think_lag + react + travel + 2
+    period = dwell + jitter                     # 引き直しの周期の上限（AI_WANDER_JITTER で散る）
+
+    # 完全な区間（引き直しから次の引き直しまで）を2つは見たい。周期は dwell に
+    # AI_WANDER_JITTER ぶん散らされるので、3周期ぶん回して端の欠けた区間を捨てる。
+    # dwell を大きくされても走行時間が延び続けないよう頭で止める（CI が遅いと誰も回さない）。
+    FRAMES = min(3 * period + allow + 20, 460)
 
     s = Scene(rom_path, labels)
     s.sleep(slots["enemy_first"], slots["count"])        # 敵を全滅させた状態にする
-    s.hold(set(), SETTLE_FRAMES)
-    tail = s.hold(set(), TAIL, lambda sc: abs(sc.x(player) - sc.x(ally)))
+    player_y = s.y(player)                               # 操作キャラは動かない（入力なし）
 
-    r.check("敵が居なくなったら仲間が %d フレーム以内に静止する（立ち位置で震えない）"
-            % SETTLE_FRAMES, len(set(tail)) == 1,
-            "落ち着いたはずの %d フレームで操作キャラとの距離が %s と動き続けている。"
-            "目標の立ち位置と実際の位置が行き過ぎ／戻りを繰り返している"
-            "（AI_DEADBAND が 0 だと 1/16 ドットの端数で毎フレーム震える）"
-            % (TAIL, sorted(set(tail))))
-    r.check("仲間が追従距離 follow_x=%d ドットのあたりに落ち着く（実測 %d）"
-            % (follow_x, tail[-1]), abs(tail[-1] - follow_x) <= SETTLE_TOL,
-            "操作キャラとの距離が %d ドット（TSV の follow_x=%d、許容 ±%d）。"
-            "ai_goal=%d（1 = REGROUP）/ ai_gap=%d。"
-            "狙う相手が居なくなったら操作キャラの側へ戻るのが万能型の約束である。"
-            "戻らないと、次の戦闘が始まったとき仲間が画面外に取り残される"
-            % (tail[-1], follow_x, SETTLE_TOL, s.get("ai_goal", ally), s.get("ai_gap", ally)))
+    def watch(sc):
+        return (abs(sc.x(player) - sc.x(ally)), sc.y(ally),
+                _signed(sc.get("ai_woff", ally)), sc.get("ai_gap", ally),
+                sc.get("ai_goal", ally))
+
+    # 作業変数（ai_woff / ai_gap）を読むので、**そのフレームの更新が終わった点**で観測する。
+    rows = s.trace(FRAMES, watch)
+
+    # 追従に入る前（思考の順番が回ってくるまで）の数フレームは捨てる。
+    first = next((i for i, row in enumerate(rows) if row[4] == goal_regroup), None)
+    if not r.check("敵が居なくなったら仲間が操作キャラへの追従（AI_GOAL_REGROUP）に入る",
+                   first is not None,
+                   "%d フレーム走らせても ai_goal が REGROUP(%d) にならない（最後の値 %d）。"
+                   "狙う相手が居なくなったら操作キャラの側へ戻るのが万能型の約束である"
+                   "（leash_x=%d が 0 だと戻らない）。戻らないと、次の戦闘が始まったときに"
+                   "仲間が画面外に取り残される"
+                   % (FRAMES, goal_regroup, rows[-1][4] if rows else -1,
+                      profiles["leash_x"][0])):
+        return
+    rows = rows[first:]
+    dists = [row[0] for row in rows]
+
+    # ---- 揺らがない型（wander か dwell が 0）は、止まったまま動かないのが正しい ----
+    if wander == 0 or dwell == 0:
+        tail = dists[-(allow + 4):]              # 落ち着くのに要る長さのぶんだけ後ろを見る
+        r.check("揺らがない設定（wander=%d / dwell=%d）では仲間が完全に静止する"
+                % (wander, dwell), len(set(tail)) == 1,
+                "落ち着いたはずの %d フレームで操作キャラとの距離が %s と動き続けている。"
+                "wander か dwell が 0 の型は立ち位置を引き直さないので、"
+                "追従距離に着いたら1ドットも動かないはずである。動くなら、"
+                "目標の立ち位置と実際の位置が行き過ぎ／戻りを繰り返している"
+                "（AI_DEADBAND が 0 だと 1/16 ドットの端数で毎フレーム震える）"
+                % (len(tail), sorted(set(tail))))
+        return
+
+    # ---- 揺らぐ型: 区間（引き直しから次の引き直しまで）に切って見る ----
+    rerolls = [i for i in range(1, len(rows)) if rows[i][2] != rows[i - 1][2]]
+    spans = list(zip(rerolls, rerolls[1:]))          # 端の欠けた区間は使わない
+
+    moved = sum(1 for a, b in zip(dists, dists[1:]) if a != b)
+    r.check("立ち位置の引き直しが来て、仲間が実際に足を出している（棒立ちに戻っていない）",
+            len(spans) >= 1 and moved > 0,
+            "%d フレームで引き直しは %d 回、距離が変わったフレームは %d。"
+            "**主が「やめろ」と言ったのはこの棒立ちである**"
+            "（「敵を排除し終えた後、AI キャラクターが棒立ちになる」）。"
+            "TSV の wander=%d / dwell=%d が読まれていないか、引き直し（ai_reroll_wander）が"
+            "同じ段を引き続けて一歩も動いていない。dwell の周期は最大 %d フレームなので、"
+            "%d フレーム観測して1度も引き直しが来ないのは不具合である。"
+            "**1段の幅 wander=%d は立ち位置の許容誤差 AI_DEADBAND=%d より確実に広く取ること**"
+            "（同じくらいだと、引き直しても許容誤差に飲まれて一歩も動かない）"
+            % (len(rows), len(rerolls), moved, wander, dwell, period, len(rows),
+               wander, deadband))
+    if not spans:
+        return
+
+    # --- 1. 往復しない（震えの決定的な特徴は往復である）---
+    wobble = []
+    for a, b in spans:
+        signs = [_sign(y - x) for x, y in zip(dists[a:b], dists[a + 1:b + 1])]
+        signs = [g for g in signs if g]
+        if len(set(signs)) > 1:
+            wobble.append((a, b, dists[a:b + 1]))
+    r.check("引き直しから次の引き直しまで、仲間の歩きが**単調**である（往復しない / %d 区間）"
+            % len(spans), not wobble,
+            "%d 区間で往復した。最初の区間 [%s]: 距離が %s と行き来している。"
+            "行き先（ai_woff）が変わっていないのに向きが変わるのは**震え**であって"
+            "揺らぎではない。目標の立ち位置と実際の位置が行き過ぎ／戻りを繰り返している"
+            "（立ち位置の許容誤差 AI_DEADBAND はいま %d。0 だと 1/16 ドットの端数で"
+            "毎フレーム震える。1フレームの歩き %d/16 ドットが許容誤差より大きいときも、"
+            "そこをまたいで往復する）"
+            % (len(wobble), "%d-%d" % wobble[0][:2] if wobble else "",
+               wobble[0][2][:24] if wobble else [], deadband, speed))
+
+    # --- 2. 区間ごとに必ず静止する（震えには止まっている時間が無い）---
+    busy = []
+    for a, b in spans:
+        still = _runs_of([dists[i] == dists[i + 1] and rows[i][1] == rows[i + 1][1]
+                          for i in range(a, b)])[0]
+        need = max(1, (b - a) - allow)
+        if still < need:
+            busy.append((a, b, still, need))
+    r.check("引き直しと引き直しの間に、仲間が静止している時間がある（%d 区間 / 震えない）"
+            % len(spans), not busy,
+            "%d 区間で静止しなかった。最初の区間 [%d-%d] は %d フレームのうち"
+            "連続して止まっていたのが最長 %d フレーム（期待 %d 以上）。"
+            "立ち位置を引き直してから落ち着くまでに許した猶予は %d フレーム"
+            "（思考の順番待ち %d ＋ 歩き出しの遅れ react=%d ＋ %d 段ぶんの歩き %d ＋ 2）。"
+            "止まる時間が無いのは、意図して歩いているのではなく**震えている**という意味である"
+            % (len(busy), busy[0][0] if busy else 0, busy[0][1] if busy else 0,
+               (busy[0][1] - busy[0][0]) if busy else 0,
+               busy[0][2] if busy else 0, busy[0][3] if busy else 0,
+               allow, think_lag, react, 3, travel))
+
+    # --- 3. 落ち着いた位置が、そのとき狙っている段と一致する ---
+    # ai_woff（符号つきの揺らぎ）と ai_gap（揺らぎを足した後の間合い）は ai-dev が
+    # .export している。**テスト側から「いまどの段を狙っているか」を読んで期待値を作る。**
+    #
+    # ただし ai_gap は**立ち位置そのものではない**。絵が縦に重なる奥行きに居る仲間は、
+    # 操作キャラの専有距離（AI_CLEAR_X）の内側に立たない——壁にならないための場の規則が
+    # 揺らぎより後に効く（ai_clear_player_zone）。内向きの揺らぎで ai_gap が専有距離を
+    # 下回ったときは、立つのは専有距離の外側である。
+    tol = deadband + step
+    off = []
+    for a, b in spans:
+        d, gap = dists[b], rows[b][3]
+        crowded = abs(rows[b][1] - player_y) < A["AI_OVERLAP_Y"]
+        want = max(gap, clear_x) if crowded else gap
+        if abs(d - want) > tol:
+            off.append((b, d, gap, want, _signed(rows[b][2])))
+    r.check("落ち着いた立ち位置が、そのとき狙っている段（ai_gap と専有距離 %d）と "
+            "%d ドット以内で一致する" % (clear_x, tol), not off,
+            "%d 区間でずれた。最初は %d フレーム目で 距離 %d / ai_gap %d → 期待 %d "
+            "（揺らぎ ai_woff=%d 段ぶん）。許容は不感帯 AI_DEADBAND=%d ＋ 1フレームの歩き %d。"
+            "決めた立ち位置と実際に立った位置が合っていない＝"
+            "歩き（ai_move_to_post）が立ち位置を目指していないか、"
+            "揺らぎ（ai_apply_wander）が間合いに足されていない"
+            % (len(off), off[0][0] if off else 0, off[0][1] if off else 0,
+               off[0][2] if off else 0, off[0][3] if off else 0,
+               off[0][4] if off else 0, deadband, step))
+
+    # --- 4. 揺らいでも追従距離そのものは壊れない ---
+    # 揺らぎは follow_x からの**ずれ**であって、間合いの作り直しではない。
+    # -1 段 〜 +2 段（TSV の約束）の外に出るなら、揺らぎが間合いを食い潰している。
+    lo, hi = max(gap_min, follow_x - wander), follow_x + 2 * wander
+    band = [(i, row[3]) for i, row in enumerate(rows) if not lo <= row[3] <= hi]
+    r.check("狙う間合いが追従距離 follow_x=%d の -1〜+2 段（%d〜%d ドット）に収まる"
+            % (follow_x, lo, hi), not band,
+            "%d フレームで外れた（最初は %d フレーム目の ai_gap=%d、許容 %d〜%d）。"
+            "揺らぎ wander=%d は follow_x からの**ずれ**であって間合いの置き換えではない。"
+            "外れるなら、引き直しが -1/0/+1/+2 段の外を引いている（ai_reroll_wander）か、"
+            "分散（ai_spread）が追従中にも足されている（この場に仲間は1体しか居ない）"
+            % (len(band), band[0][0] if band else 0, band[0][1] if band else 0,
+               lo, hi, wander))
 
 
 # ---------------------------------------------------------------- プロファイル番号
@@ -647,3 +877,157 @@ def _check_hurt_blocks_input(rom_path, labels, profiles, r):
             "のけぞり中に入力を受け付けないことと、のけぞりが明けても受け付けないことは"
             "別物である。後者なら操作不能の不具合"
             % (y0, y_after, push))
+
+
+# ---------------------------------------------------------------- ヘイト
+def _hate_score(dist, hate, mid):
+    """ai_select_target が付ける「遠さ'」を Python で写したもの。
+
+        遠さ' = 遠さ - (hate - AI_HATE_MID)     （0..255 で頭打ち）
+
+    ai.s 側はこれを 8bit の桁借りで場合分けせずに計算している（走査の内側なので
+    jsr も分岐も削ってある）。**テスト側は約束の式の方を持つ。**
+    実装の写しを持つと、実装が間違ったときにテストも同じだけ間違う。
+    """
+    return max(0, min(255, dist - (hate - mid)))
+
+
+def _predict_target(cands, hates, mid):
+    """候補 [(番号, 遠さ)] のうち、ai_select_target が選ぶはずの相手。
+
+    同点なら番号の小さい方（走査は番号順で、同点は先に見た方を残す）。
+    """
+    best, best_score = None, 256
+    for slot, dist in cands:
+        score = _hate_score(dist, hates[slot], mid)
+        if score < best_score:
+            best, best_score = slot, score
+    return best
+
+
+def _check_hate(rom_path, labels, profiles, r):
+    """ヘイト（狙われやすさ）の目盛り。**P1 では全行が中立なので画面は何も変わらない。**
+
+    それでも今ここで縛るのは、P2 で6型に列を埋めた瞬間に役割分担（タンクが狙いを集め、
+    遠隔型が狙われにくい）が出る**足場**だからである。値を入れてから
+    「効かない／効きすぎる」を調べるのでは、原因が型の設計か算数かを切り分けられない。
+
+    見るのは2つ:
+      1. 中立（AI_HATE_MID = 128）では、狙われ方が**距離だけ**で決まる（素通りする）
+      2. 値を振ると、距離が同じでも狙われ方が変わる（大きいほど近くに見える）
+
+    2 のために、**ROM の ai_p_hate の1バイトだけを書き換えた写し**を作って起動する。
+    いまの TSV には中立以外の行が無いので、そうしないと「振ったら変わる」を
+    一度も通らないまま P2 に入ることになる（l2_action の _probe_depth_tol と同じ考え方）。
+    """
+    r.section("ヘイト（狙われやすさ。AI_HATE_MID が中立 / P2 に向けた足場）")
+
+    A = ai_defs()
+    mid = A["AI_HATE_MID"]
+    slots = slot_ranges(labels)
+    player, ally, enemy = slots["player"], slots["ally_first"], slots["enemy_first"]
+    aggr = profiles["aggr_x"][1]            # 敵の攻撃性。これより遠い相手には食いつかない
+
+    # 距離の差と、ヘイトの振り幅。振り幅は「距離の差を確実に覆す」大きさにする。
+    GAP = A["AI_SPREAD"]
+    NEAR = 40
+    DELTA = 2 * GAP
+
+    def aim(scene, d_player, d_ally, ally_profile=0):
+        """敵に1回だけ考えさせ、誰を狙ったかを返す。
+
+        思考は1フレームに AI_THINK_PER_FRAME 体ぶんしか回らないので、
+        ai_cursor（.export されている）を敵の1つ手前に置いて順番を作る。
+        こうすると**1フレームで**狙いが決まり、観測の間に誰も歩かない。
+        """
+        scene.sleep(enemy + 1, slots["count"])       # 敵は1体だけにする
+        ex, y = 200, scene.y(player)
+        for i, x in ((enemy, ex), (player, ex - d_player), (ally, ex - d_ally)):
+            scene.set_x(i, x)
+            scene.put("ent_y", i, y)
+            scene.put("ent_state", i, ACT_ST_IDLE)
+        scene.put("ent_ai", ally, ally_profile)
+        scene.put("ai_cursor", 0, enemy - 1)
+        scene.call("ai_update")
+        return scene.get("ai_target", enemy)
+
+    def expect(d_player, d_ally, hates):
+        return _predict_target([(player, d_player), (ally, d_ally)], hates, mid)
+
+    # --- 1. 中立: 狙われ方は距離だけで決まる ---
+    # P1 の表は全行が中立なので、ここは「近い方を狙う」になる。P2 で列が埋まったら
+    # **主張の形が変わる**（近い方ではなく、目盛りを織り込んだ式どおりになる）ので、
+    # 期待値は式（_hate_score）から作り、名前の方で今どちらを見ているかを出す。
+    base_hates = {player: profiles["hate"][0], ally: profiles["hate"][0]}
+    neutral = base_hates[player] == base_hates[ally] == mid
+    s = Scene(rom_path, labels)
+    cases = []
+    for d_player, d_ally, why in ((NEAR, NEAR + GAP, "操作キャラの方が近い"),
+                                  (NEAR + GAP, NEAR, "仲間の方が近い")):
+        got = aim(s, d_player, d_ally)
+        want = expect(d_player, d_ally, base_hates)
+        if got != want:
+            cases.append("%s（%d ドット vs %d ドット）のに #%d を狙った（期待 #%d）"
+                         % (why, d_player, d_ally, got, want))
+    r.check("ヘイトが中立（%d）のあいだ、敵は**近い方**を狙う（ヘイトの項が素通りする）" % mid
+            if neutral else
+            "敵が狙う相手が「遠さ - (hate - %d)」の式どおりに決まる"
+            "（TSV の hate: 操作キャラ側=%d / 仲間側=%d）"
+            % (mid, base_hates[player], base_hates[ally]),
+            not cases,
+            "%s。TSV の hate は 操作キャラ側=%d / 仲間側=%d（中立は %d）。"
+            "中立の行で狙いが距離と食い違うなら、目盛りの中点がずれているか、"
+            "(hate - %d) の符号が逆になっている（低いはずの者が狙われる）"
+            % ("／".join(cases), base_hates[player], base_hates[ally], mid, mid))
+
+    # --- 2. 値を振ると狙われ方が変わる ---
+    if "ai_p_hate" not in labels:
+        return
+    probe = Nes(rom_path)
+    probe.reset()
+    offset = probe.mapper.prg_offset(labels["ai_p_hate"])
+    with open(rom_path, "rb") as f:
+        image = bytearray(f.read())
+    head = len(image) - len(probe.rom.prg) - len(probe.rom.chr)
+
+    # 書き換える行は**仲間と別の行**でなければ差が出ない（同じ行なら両者とも動く）。
+    # P1 の表は2行しか無いので、敵の行（1）を借りて仲間に着せる。
+    row = min(len(profiles["hate"]) - 1, 1)
+    if not r.check("ヘイトを振る実験に使える行が2行以上ある", row >= 1,
+                   "ai_params.s の表が %d 行しかない。仲間と操作キャラに別々のヘイトを"
+                   "与えられないので、「振ったら変わる」を確かめられない"
+                   % len(profiles["hate"])):
+        return
+
+    import tempfile                        # noqa: PLC0415 — この節だけで使う
+    with tempfile.TemporaryDirectory() as tmp:
+        swings = []
+        for value, d_player, d_ally, why in (
+                (mid + DELTA, NEAR, NEAR + GAP, "遠くに居ても狙われる（タンク）"),
+                (mid - DELTA, NEAR + GAP, NEAR, "近くに居ても狙われない（遠隔型）")):
+            image[head + offset + row] = value & 0xFF
+            path = os.path.join(tmp, "hate_%d.nes" % value)
+            with open(path, "wb") as f:
+                f.write(image)
+            ps = Scene(path, labels)
+            # このプローブが本物を測っていることの自己検査（書き換えが効いているか）。
+            seen = ps.nes.read(labels["ai_p_hate"] + row)
+            if seen != value & 0xFF:
+                r.check("ROM の ai_p_hate を書き換えた写しが起動する", False,
+                        "書き換えた ROM で ai_p_hate[%d] が %d と読めた（書いたのは %d）。"
+                        "PRG のバンク割り当てが変わって、別の場所を書き換えている"
+                        % (row, seen, value))
+                return
+            got = aim(ps, d_player, d_ally, ally_profile=row)
+            hates = {player: profiles["hate"][0], ally: value}
+            want = expect(d_player, d_ally, hates)
+            if got != want:
+                swings.append("hate=%d（中立 %+d）で %s はずが #%d を狙った（期待 #%d / "
+                              "距離は 操作キャラ %d・仲間 %d ドット）"
+                              % (value, value - mid, why, got, want, d_player, d_ally))
+        r.check("ヘイトを中立から %+d / %+d に振ると、距離が同じでも狙われ方が変わる"
+                % (DELTA, -DELTA), not swings,
+                "%s。約束は「遠さ' = 遠さ - (hate - %d)」で、ヘイトの高い者は"
+                "**実際より近くに居るものとして**測られる（攻撃性 aggr_x=%d と同じ物差し）。"
+                "ここが効かないと、P2 で庇護型に狙いを集める設計が列を埋めても動かない"
+                % ("／".join(swings), mid, aggr))

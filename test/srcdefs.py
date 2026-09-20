@@ -105,6 +105,16 @@ def action_defs():
     return defs("src/action/action_params.inc", "src/action/action.inc", "src/constants.inc")
 
 
+def ai_defs():
+    """AI の「場の規則」側の調整値（型ごとの値は data/ai_params.tsv が正本）。
+
+    AI_DEADBAND / AI_WANDER_JITTER / AI_HATE_MID などは ai_params.inc の
+    アセンブル時定数で、ROM にもラベルにも現れない。**主が回すノブ**なので、
+    期待値はここから読む（テストに数値を書かない）。
+    """
+    return defs("src/ai/ai_params.inc", "src/ai/ai.inc", "src/constants.inc")
+
+
 def body_rows(d=None):
     """体格型（BODY_*）ごとの「絵の段数」を constants.inc の並び順で返す。
 
