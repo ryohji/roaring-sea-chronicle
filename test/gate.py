@@ -118,3 +118,21 @@ def boot_or_fail(gate, needs, what):
                  "この層は1件も走らせられない。上の節ごとの落とし方（gate.run_sections）と違い、"
                  "ここだけは層ごと飛ばす" % (", ".join(gone), what))
     return False
+
+
+def skip_sections(r, sections, why):
+    """節をまるごと**飛ばす**（落とさない）。
+
+    run_sections との違いは「飛ばす理由」である。
+      * run_sections が落とすのは**ラベルが消えた**とき。見張っていた主張が
+        誰にも見張られなくなったのだから、それは失敗である。
+      * こちらが飛ばすのは、検証の対象そのものが**ビルドに載っていない**とき
+        （src/debug.inc の DBG_ENABLE = 0 でデバッグ機構が丸ごと消える場合）。
+        無いものは壊れようがないので失敗ではない。
+
+    どちらの場合も**黙って消えない**ことが肝である。飛ばした節は SKIP として
+    出力に出て、最後の要約にも件数と一覧が出る（run_tests.Results.skip）。
+    """
+    for name, _needs, _fn in sections:
+        r.skip("%s の検証" % name, why)
+    return len(sections)

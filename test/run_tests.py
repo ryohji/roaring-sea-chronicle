@@ -87,10 +87,22 @@ class Results:
     def __init__(self):
         self.passed = 0
         self.failed = []
+        self.skipped = []
 
     def section(self, title):
         """テストが増えても読めるように、層の中を小見出しで区切る。"""
         print("  -- %s" % title)
+
+    def skip(self, name, why):
+        """検証の**対象がビルドに載っていない**ので走らせなかった、を記録する。
+
+        失敗ではない（無いものは壊れようがない）。しかし**黙って消えてはならない**ので、
+        その場で SKIP として出し、最後の要約にも件数と一覧を出す。
+        ラベルが消えた（＝見張っていた主張が見張られなくなった）ときはこちらではなく
+        失敗として扱うこと。使い分けは test/gate.py の skip_sections に書いてある。
+        """
+        self.skipped.append((name, why))
+        print("  SKIP  %s\n        %s" % (name, why))
 
     def check(self, name, ok, detail=""):
         if ok:
@@ -549,8 +561,13 @@ def main(argv=None):
     ran_l3 = layer3_mesen(args.rom, r)
 
     print()
-    print("結果: %d 件成功 / %d 件失敗   (L3 自動プレイ: %s)"
-          % (r.passed, len(r.failed), "実行" if ran_l3 else "未実行"))
+    print("結果: %d 件成功 / %d 件失敗 / %d 件スキップ   (L3 自動プレイ: %s)"
+          % (r.passed, len(r.failed), len(r.skipped), "実行" if ran_l3 else "未実行"))
+    if r.skipped:
+        print()
+        print("飛ばしたテスト（対象がビルドに載っていない。失敗ではない）:")
+        for name, why in r.skipped:
+            print("  - %s: %s" % (name, why))
     if r.failed:
         print()
         print("失敗したテスト:")

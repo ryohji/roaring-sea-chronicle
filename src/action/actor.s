@@ -25,7 +25,7 @@
 .export act_atk_ent, act_scan_end, act_kb_dir, act_kb_amt, act_dmg_amt
 .export act_dy, act_tol
 ; --- 外に見せる状態 ---
-.export act_ready, act_player_failed
+.export act_ready, act_player_failed, act_lframe
 ; --- 手続き ---
 .export action_init, act_init_entity, action_update, act_update_actor
 .export act_role, act_move_left, act_move_right, act_set_pal
@@ -84,6 +84,16 @@ act_dmg_amt:  .res 1              ; 与えるダメージ
 act_dy:       .res 1              ; 奥行き判定の作業（攻撃側と被弾側の足元Yの差）
 act_tol:      .res 1              ; 同（その組み合わせのY許容幅）
 act_ready:    .res 1              ; action_init 済みか（0 = まだ）
+; 論理フレームカウンタ。**action_update が1回走るごとに1増える。**
+; ゼロページの frame_counter（NMI が毎フレーム加算する実フレーム）と違い、
+; デバッグのスロー（src/debug.inc の dbg_slow）で論理更新が間引かれると
+; こちらも同じだけ遅くなる。
+;   運動（歩きのコマ送り）は論理フレームで数える。移動量も論理フレームで積むので、
+;   これを実フレームで数えると、半速のとき「進む距離：脚の運び」が 1:2 にずれる。
+;   通知（点滅）は実フレーム（frame_counter）のまま。点滅は運動ではなく人間への
+;   合図なので、スロー中も同じ速さで明滅した方が読める。
+; **この2つが揃っていないのは書き忘れではない**（act_present / act_pose_for_state）。
+act_lframe:   .res 1
 ; 操作キャラの猶予が切れた = シナリオ失敗（ADR-0005）。
 ; **ここで立てるのはフラグまで**である。失敗の演出とオートセーブからの再開は
 ; P4 の campaign-dev の担当（docs/plan.md P4）。
@@ -217,6 +227,7 @@ act_player_failed: .res 1
         bne @ready
         jsr action_init                  ; 呼び忘れの保険。シーン開始で明示的に呼ぶのが正しい
 @ready:
+        inc act_lframe                   ; 論理フレーム（スロー中は実フレームより遅く進む）
         jsr act_input_gate
         jsr act_input_buffer
 
@@ -687,7 +698,10 @@ act_player_failed: .res 1
         lda #ACT_WALK_ANIM
         bcc :+
         lda #ACT_RUN_ANIM
-:       and frame_counter
+        ; 歩き・小走りのコマ送りだけは**論理フレーム**で数える。移動量も論理フレームで
+        ; 積むので、実フレームで数えるとスロー中に「進む距離：脚の運び」が 1:2 にずれる。
+        ; 点滅（act_present の3箇所）は逆に frame_counter のままである。理由は act_lframe の宣言に。
+:       and act_lframe
         beq @stand
         lda #ACT_POSE_MOVE
         jmp @set

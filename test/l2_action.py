@@ -35,9 +35,10 @@ sys.path.insert(0, HERE)
 
 from cpu6502 import CpuCrash                        # noqa: E402
 from nes import Nes, boot, frame_end, load_labels, step_frame   # noqa: E402
-from scene import slot_ranges                       # noqa: E402
-from gate import Gate, run_sections, boot_or_fail   # noqa: E402
+from scene import slot_ranges, disarm_enemies       # noqa: E402
+from gate import Gate, run_sections, boot_or_fail, skip_sections   # noqa: E402
 from srcdefs import action_defs, body_rows          # noqa: E402
+import dbgmode                                      # noqa: E402
 
 D = action_defs()
 
@@ -129,9 +130,12 @@ def layer2_action(rom_path, labels, r):
           "act_flags", "act_invuln"), _check_hit_uses_tolerance),
         ("Y許容幅が絵の段数に追随する（ADR-0009 残る論点 1-a）",
          ("act_depth_tol",), _check_tol_follows_body),
+        # frame_counter と act_lframe の**両方**を挙げてある。歩きのコマ送りは
+        # act_lframe（論理フレーム）で刻まれ、姿勢を固定するために frame_counter も
+        # 0 に倒すからである。どちらか片方でも消えたらこの節は落ちる（黙って飛ばない）。
         ("姿勢（攻撃とのけぞりが別の絵）",
          ("act_present", "act_pose_by_state", "ent_set_pose", "ent_tile0",
-          "act_flags", "frame_counter"), _check_poses),
+          "act_flags", "frame_counter", "act_lframe"), _check_poses),
         ("敵の攻撃が避けられる",
          ("act_start_attack", "act_update_actor", "action_update_player", "act_pad",
           "act_mset", "act_mset_base", "atk_startup", "atk_active", "atk_reach",
@@ -157,6 +161,19 @@ def layer2_action(rom_path, labels, r):
           "act_flags", "act_hurt_w", "atk_reach"), _check_effects),
     )
     run_sections(gate, sections, lambda fn: (rom_path, labels, r))
+
+    # 手触り確認のためのデバッグ機構（src/debug.inc）を見る節。**仕様ではない。**
+    # DBG_ENABLE = 0 だとコードごと消えるので、そのときは落とさずに飛ばす
+    # （無いものは壊れようがない）。飛ばしたことは SKIP として出力に出る。
+    dbg_sections = (
+        ("スローと2つの時計（歩きは論理フレーム / 点滅は実フレーム）",
+         ("dbg_slow", "act_lframe", "frame_counter", "act_invuln", "ent_attr",
+          "ent_tile", "act_attr0"), _check_slow_clocks),
+    )
+    if dbgmode.enabled():
+        run_sections(gate, dbg_sections, lambda fn: (rom_path, labels, r))
+    else:
+        skip_sections(r, dbg_sections, dbgmode.SKIP_WHY)
 
 
 # ---------------------------------------------------------------- Y許容幅
@@ -412,7 +429,13 @@ def _check_poses(rom_path, labels, r):
     y = a.get("depth_y_min") + 20 if "depth_y_min" in labels else 180
     a.stand(a.player, 64, y, body=0)
     base = a.get("ent_tile0", a.player)
+    # 歩きの位相を固定する。ここで見たいのは「状態ごとに姿勢が変わる」ことだけなので、
+    # 2コマの歩行（立ち⇄歩き）の位相が混ざらないように**両方の時計を 0 に倒す**。
+    # 歩きのコマ送りは act_lframe（論理フレーム）、点滅は frame_counter（実フレーム）で、
+    # **食い違っているのは意図である**（src/action/action_params.inc の 6-c）。
+    # どちらの時計が姿勢に効くかが将来入れ替わっても、この節が位相で揺れないようにする。
     a.put("frame_counter", 0, 0)
+    a.put("act_lframe", 0, 0)
     wrong = []
     tiles = {}
     for st in range(states):
@@ -440,7 +463,10 @@ def _check_poses(rom_path, labels, r):
     a.call("act_present", x=a.player)
     standing = a.get("ent_tile", a.player)
     a.put("act_flags", a.player, D["ACT_F_MOVED"])
-    a.put("frame_counter", 0, D["ACT_WALK_ANIM"] or 0)
+    # 歩きのコマ送りを刻むのは **act_lframe**（action_update ごとに1増える論理フレーム）
+    # であって frame_counter ではない。立ちに戻るのは AND が 0 のフレームなので、
+    # 歩きの絵が出る位相に立てる。
+    a.put("act_lframe", 0, D["ACT_WALK_ANIM"] or 0)
     a.call("act_present", x=a.player)
     walking = a.get("ent_tile", a.player)
     want_walk = base + D["ACT_POSE_MOVE"] * stride
@@ -1160,3 +1186,173 @@ def _sgn8(v):
 
 def _ceil_div(a, b):
     return -(-a // max(1, b))
+
+
+# ================================================================ スローと2つの時計
+# ここだけは **src/debug.inc の DBG_ENABLE = 1 のときにしか存在しない**機構を見る。
+# 0 のときはコードごと消えるので、節ごと **SKIP**（失敗ではない）にする。
+# 使い分けの理由は test/dbgmode.py と test/gate.py の skip_sections に書いてある。
+#
+# 何を守っているか
+# ----------------
+# 歩き・小走りのコマ送りは **act_lframe**（action_update ごとに1増える論理フレーム）、
+# 点滅の3つ（予備動作・無敵・猶予）は **frame_counter**（NMI が毎フレーム進める実フレーム）
+# で刻まれている。**この2つはわざと食い違っている。**
+#
+#   歩きは運動である。移動量も論理フレームで積むので、実フレームで数えると
+#   スロー中に「進む距離：脚の運び」がずれて脚が空回りする。
+#   点滅は運動ではなく人間への通知である。実時間に対して一定の速さで明滅する方が読め、
+#   スロー中も合図が間延びしない。
+#
+# 後から誰かが「揃っていないのは書き忘れだ」と思って揃えるのが最悪の失敗なので、
+# **食い違っていること自体**をここで主張する。片方だけを見ると（移動量だけ／切替回数だけ）
+# もう片方が置き去りになっても通ってしまうので、見るのは**比**である。
+
+# 観測する**論理フレーム**の数。dbg_slow によらずこれだけの論理更新を見る
+# （実フレーム数は dbg_slow+1 倍になる）。歩きのコマ送りが十数回切り替わる長さ。
+SLOW_LOGICAL_FRAMES = 64
+
+
+def _transitions(seq):
+    """値が変わった標本の位置（変わった**後**の添字）の並び。"""
+    return [i for i in range(1, len(seq)) if seq[i] != seq[i - 1]]
+
+
+def _slow_run(rom_path, labels, want_slow):
+    """dbg_slow = want_slow にして RIGHT を押しっぱなしにし、1フレームずつ観測する。
+
+    戻り値は観測の要約（下の dict）。**モードは START を実際に押して入る**
+    （変数に直接書くと、ボタンの結線が切れても気付けない）。
+    """
+    a = Actors(rom_path, labels)
+    disarm_enemies(a.nes, labels)      # 見たいのは歩きと点滅であって戦闘ではない
+    slow = dbgmode.to_mode(a, "START", "dbg_slow", want_slow)
+    frames = SLOW_LOGICAL_FRAMES * (slow + 1)
+
+    a.nes.set_buttons({"RIGHT"})
+    xs, tiles, pals = [], [], []
+    for _ in range(frames):
+        # 無敵の点滅を観測窓のあいだ立て続ける。**点滅そのものを直接書いてはいない**
+        # （act_invuln は状態であってモードではない。色を決めるのは act_present）。
+        a.put("act_invuln", a.player, 0xFF)
+        step_frame(a.nes, a.labels, 1)
+        xs.append(a.x(a.player))
+        tiles.append(a.get("ent_tile", a.player))
+        pals.append(a.get("ent_attr", a.player) & 3)
+    a.nes.set_buttons(set())
+
+    walk = _transitions(tiles)
+    blink = _transitions(pals)
+    out = {"slow": slow, "frames": frames, "walk_n": len(walk), "blink_n": len(blink),
+           "moved": xs[-1] - xs[0], "pals": set(pals), "tiles": set(tiles),
+           "invuln": a.get("act_invuln", a.player)}
+    # **端の切り捨て**が肝である。固定の窓で「切替回数」を数えると、窓の両端が
+    # 周期のどの位相に当たるかで回数が ±1 ぶれる（frame_counter の初期位相は
+    # START を何回押したかで変わる）。最初の切替から最後の切替までを見れば、
+    # 「切替と切替の間」が丸ごと何本入ったかだけになり、位相に依存しない。
+    if len(walk) >= 2:
+        out["walk_steps"] = len(walk) - 1                      # コマの切替の「間」の本数
+        out["walk_move"] = xs[walk[-1]] - xs[walk[0]]          # その間に進んだドット
+        out["walk_span"] = walk[-1] - walk[0]                  # その間の**実**フレーム数
+    if len(blink) >= 2:
+        out["blink_steps"] = len(blink) - 1
+        out["blink_span"] = blink[-1] - blink[0]               # **実**フレーム数
+    return out
+
+
+def _check_slow_clocks(rom_path, labels, r):
+    r.section("スローと2つの時計（歩きは論理フレーム / 点滅は実フレーム）")
+
+    modes = list(range(dbgmode.mode_count()))
+    runs = [_slow_run(rom_path, labels, m) for m in modes]
+
+    # --- 0. ボタンでモードに入れたか（結線の検査）---
+    got = [run["slow"] for run in runs]
+    r.check("START を押すと dbg_slow が %s と巡回する（モードに変数で入らない）"
+            % " → ".join(str(m) for m in modes + [0]), got == modes,
+            "START を押して入ったつもりの dbg_slow が %s（期待 %s）。"
+            "src/main.s の dbg_buttons が pad_pressed を読めていないか、"
+            "PAD_START のビットが違うか、dbg_bump の巡回が DBG_MODE_COUNT と合っていない。"
+            "**ここが落ちている間、下のスローの主張は何も確かめていない**"
+            % (got, modes))
+
+    # --- 1. 空振り防止（観測窓の中で実際に歩き、実際に点滅したか）---
+    thin = ["dbg_slow=%d: コマ切替 %d 回 / 点滅切替 %d 回 / 前進 %d ドット"
+            % (run["slow"], run["walk_n"], run["blink_n"], run["moved"])
+            for run in runs
+            if run["walk_n"] < 4 or run["blink_n"] < 4 or run["moved"] <= 0]
+    r.check("どのモードでも観測窓の中で歩き続け、コマ送りと点滅を4回以上観測できた", not thin,
+            "%s。前進が止まっている（ワールド端に着いた／のけぞっている）か、"
+            "コマ送り・点滅が一度も切り替わっていない。**この行が落ちている間、"
+            "下の2つの主張は空振りである**（比を作る標本が無い）" % "／".join(thin))
+    if any("walk_steps" not in run or "blink_steps" not in run for run in runs):
+        return
+
+    # --- 2. 歩きはスローに追従する（核心その1）---
+    # 「1コマあたりの進行距離が dbg_slow によらず一定」。
+    # 移動量だけ・切替回数だけを見ると、片方を直したときにもう片方が置き去りに
+    # なっても通ってしまう。**比**で縛るのはそのためである。
+    # 整数の交差積で比べる（割り算の丸めで判定が揺れないように）。
+    base = runs[0]
+    bad = [run for run in runs
+           if run["walk_move"] * base["walk_steps"] != base["walk_move"] * run["walk_steps"]]
+    r.check("1コマあたりの進行距離が dbg_slow によらず一定（%s）"
+            % " / ".join("%d:%s" % (run["slow"], _ratio(run["walk_move"], run["walk_steps"]))
+                         for run in runs), not bad,
+            "1コマあたり %s ドット（dbg_slow=%d の %s ドットと違う）。"
+            "歩きのコマ送り（ACT_WALK_ANIM / ACT_RUN_ANIM の AND の相手）が "
+            "act_lframe ではなく frame_counter で刻まれている疑いが濃い。"
+            "スロー中に脚だけ実時間で動くと、進む距離と脚の運びが 1:2 にずれて**空回りして見える**。"
+            "移動は論理フレームで積むのだから、コマ送りも論理フレームで刻むこと"
+            % (" / ".join("%s（dbg_slow=%d）" % (_ratio(b["walk_move"], b["walk_steps"]), b["slow"])
+                          for b in bad),
+               base["slow"], _ratio(base["walk_move"], base["walk_steps"])))
+
+    slow_bad = [run for run in runs
+                if run["walk_span"] * base["walk_steps"]
+                != base["walk_span"] * run["walk_steps"] * (run["slow"] + 1)]
+    r.check("1コマの長さが**実フレーム**で dbg_slow+1 倍に伸びる（歩きはスローに追従する）",
+            not slow_bad,
+            "%s（dbg_slow=%d の %s 実フレーム × (dbg_slow+1) が期待）。"
+            "スローにしてもコマ送りの実時間の速さが変わっていない＝歩きが"
+            "論理更新の間引きに追従していない"
+            % (" / ".join("dbg_slow=%d で1コマ %s 実フレーム"
+                          % (b["slow"], _ratio(b["walk_span"], b["walk_steps"])) for b in slow_bad),
+               base["slow"], _ratio(base["walk_span"], base["walk_steps"])))
+
+    # --- 3. 点滅はスローに追従しない（核心その2）---
+    # **0 と 1 の比較に限る。**dbg_slow=2（1/3速）では、速い点滅（4フレーム周期）が
+    # 標本化のエイリアシングで見かけ12フレーム周期に伸びる（4 と 3 の最小公倍数の位相で
+    # しか標本が取れない）。frame_counter は等速で進み続けているので**点滅そのものは
+    # 正しく明滅している**——画面に出る絵を1/3しか観測できないだけである。
+    # これは仕組み上そうなるもので不具合ではない。2 を含めると意味のない赤になる。
+    pair = [run for run in runs if run["slow"] in (0, 1)]
+    if len(pair) == 2:
+        a0, a1 = pair
+        same = (a0["blink_span"] * a1["blink_steps"] == a1["blink_span"] * a0["blink_steps"])
+        r.check("無敵の点滅の周期が dbg_slow 0 と 1 で変わらない（%s / %s 実フレーム）"
+                % (_ratio(a0["blink_span"], a0["blink_steps"]),
+                   _ratio(a1["blink_span"], a1["blink_steps"])), same,
+                "等速では %s 実フレームに1回、半速では %s 実フレームに1回（%d 回 / %d 回の切替）。"
+                "点滅（ACT_BLINK_HURT の AND の相手）が frame_counter ではなく act_lframe で"
+                "刻まれている疑いが濃い。**歩きと揃っていないのは書き忘れではない**"
+                "（src/action/action_params.inc の 6-c）。点滅は運動ではなく人間への通知なので、"
+                "スロー中も実時間で一定に明滅させる。揃えると猶予の残りを知らせる"
+                "「速くなる点滅」までスローで間延びする"
+                % (_ratio(a0["blink_span"], a0["blink_steps"]),
+                   _ratio(a1["blink_span"], a1["blink_steps"]),
+                   a0["blink_n"], a1["blink_n"]))
+        r.check("点滅が**無敵**の点滅である（観測窓の終わりまで act_invuln が立っている）",
+                all(run["invuln"] > 0 for run in pair)
+                and all(D["ACT_PAL_BLINK"] in run["pals"] for run in pair),
+                "act_invuln=%s / 観測したパレット=%s（沈む側は ACT_PAL_BLINK=%d のはず）。"
+                "無敵が切れて別の理由で色が変わっているなら、上の周期は点滅を見ていない"
+                % ([run["invuln"] for run in pair], [sorted(run["pals"]) for run in pair],
+                   D["ACT_PAL_BLINK"]))
+
+
+def _ratio(num, den):
+    """割り切れるなら整数、割り切れないなら「分子/分母」で見せる（丸めて誤魔化さない）。"""
+    if den and num % den == 0:
+        return str(num // den)
+    return "%d/%d" % (num, den)
