@@ -31,6 +31,8 @@
 .include "../action/action.inc"
 .include "ai.inc"
 .include "ai_params.inc"
+; 手触り確認のための門（dbg_ally）。**仕様ではない。**DBG_ENABLE = 0 で丸ごと消える。
+.include "debug.inc"
 
 .export ai_init, ai_init_entity, ai_update
 .export ai_goal, ai_target, ai_gap, ai_flags, ai_timer
@@ -46,6 +48,12 @@
 .import ai_p_hate, ai_p_react, ai_p_wander, ai_p_dwell
 .import ai_default_profile
 
+.if ::DBG_ENABLE
+; engine（src/main.s）は SELECT で値を回すだけで、意味は解釈しない。
+; **意味を決めるのはこのファイルである**（src/debug.inc の注記）。
+.import dbg_ally
+.endif
+
 ; 自律行動の対象になる区画（仲間 + 敵）。操作キャラ(0)と共用枠は含まない。
 AI_FIRST = ENT_ALLY_FIRST
 AI_END   = ENT_FREE_FIRST
@@ -54,6 +62,35 @@ AI_END   = ENT_FREE_FIRST
 ; AI_DIR_NEAREST = 向きにこだわらない（いま立ち位置がある側＝近い方の外へ出す）。
 ; 調整値ではなく符号なので ai_params.inc ではなくここに置く。
 AI_DIR_NEAREST = $FF
+
+.if ::DBG_ENABLE
+; --------------------------------------------------------------------------
+; 仲間の確認モード（dbg_ally）の**意味**
+; --------------------------------------------------------------------------
+; 主が P1 の手触りを見るための仕掛けであり、遊びの仕様ではない。
+; 主の言葉:「敵の攻撃を待つなどしている間に AI キャラクターが敵を殲滅してしまいます」。
+; 既定（0）の挙動は**1ビットも変えない**。門は ai_act_one に1つ、
+; 考え直しに1つ、敵の標的選びの入口に1つで、どれも走査の内側には無い。
+;
+;   0 … 通常（今までどおり）
+;   1 … 攻撃しない。考え・歩き・追従し・揺らぐが、振るのだけをやめる
+;        （敵の標的にはなる。「仲間が居るときの位置取り」を見たまま決着だけ止める）
+;   2 … 休ませる。思考も移動も攻撃もしない。**敵の標的からも外れる**（実質1対3）
+;        ただし操作キャラに押されて退くのだけは残す（止めると壁になる＝最優先の不具合）
+; 門が名指しで見分けるのは「休ませる」だけである（それ以外の 0 でない値は
+; 「攻撃しない」として扱う）。engine が段数を増やしても、増えた段は安全側＝
+; 「攻撃しない」に倒れる。
+DBG_ALLY_MUTE = 1
+DBG_ALLY_REST = 2
+.assert DBG_ALLY_REST < DBG_MODE_COUNT, error, "確認モードの段数が engine の巡回より多い"
+.assert DBG_ALLY_MUTE < DBG_ALLY_REST, error, "門は「2 でなければ攻撃しない」で分けている"
+
+; 「攻撃しない」を、**振るまでの間隔（atk_gap）を毎フレーム積み直す**ことで作る。
+; ai_try_attack の内側に条件を撒かずに済み、構え・間合い・向きは通常のまま残る
+; （型の個性のうち「どこに立つか」は見えたままで、「振る」だけが消える）。
+; 1 では足りない: 門の直後に ai_tick_timers が1つ減らすので、同じフレームで 0 になる。
+DBG_ALLY_MUTE_HOLD = 2
+.endif
 
 ; 揺らぎを引く 8bit LFSR の種。**0 以外の固定値**であること
 ; （0 から出られない／種が動くと再現しなくなる）。値そのものに意味は無い。
@@ -276,9 +313,21 @@ ai_urgent:  .res 1              ; 今この瞬間、**自分の体が**操作キ
 ; 動けない状態（のけぞり・ダウン・攻撃中）でも考えてよい。考えた結果を実行するかは
 ; ai_act_one が決める。
 .proc ai_think_for
+.if ::DBG_ENABLE
+        lda dbg_ally             ; 休ませている仲間は考え直さない（既定 0 は素通り）
+        cmp #DBG_ALLY_REST
+        bne :+
+        cpx #ENT_ENEMY_FIRST
+        bcc @rest                ; **敵には一切効かせない**（敵が黙ったら見る物が消える）
+:
+.endif
         jsr ai_load_profile
         jsr ai_select_target
         jmp ai_plan
+.if ::DBG_ENABLE
+@rest:
+        rts                      ; 目標・立ち位置・揺らぎを**そのまま凍らせて**返る
+.endif
 .endproc
 
 ; X = エンティティ番号 → ai_prof にプロファイル行を入れる。X, Y は壊さない。
@@ -329,6 +378,17 @@ ai_urgent:  .res 1              ; 今この瞬間、**自分の体が**操作キ
         lda #ENT_PLAYER          ; 敵 → 操作キャラと仲間の区画を見る
         sta ai_cand
         lda #ENT_ENEMY_FIRST
+.if ::DBG_ENABLE
+        ; 休ませている仲間（dbg_ally = 2）は**狙われない**。棒立ちの仲間に敵が
+        ; 張りつくと、結局1対1の間合いが見られないからである（主の求め＝実質1対3）。
+        ; 走査の**外**で終端を縮めるので、候補ごとの条件は1つも増えていない。
+        ; 区画が [操作キャラ][仲間][敵] の順に並んでいるので、終端を仲間の手前に
+        ; 置き直すだけで「操作キャラだけを見る」になる。
+        ldy dbg_ally
+        cpy #DBG_ALLY_REST
+        bne @scan
+        lda #ENT_ALLY_FIRST
+.endif
 @scan:
         sta ai_scan_end
 
@@ -738,6 +798,14 @@ ai_urgent:  .res 1              ; 今この瞬間、**自分の体が**操作キ
 ; 「操作キャラの前に立たない」規則は立ち位置の計算に織り込んである
 ; （ai_move_to_post → ai_clear_player_zone）。目標より先に効く。
 .proc ai_act_one
+.if ::DBG_ENABLE
+        ; --- 仲間の確認モードの門（dbg_ally）。**行動側の門はここ1箇所だけ** ---
+        ; 既定（0）は比較1回で素通りし、以降は今までと**完全に同じ経路**を通る。
+        lda dbg_ally
+        beq dbg_resume
+        jmp dbg_ally_gate
+dbg_resume:
+.endif
         jsr ai_load_profile      ; 時間の経過（揺らぎの引き直し）が表を引くので先に
         jsr ai_tick_timers
 
@@ -787,6 +855,19 @@ ai_urgent:  .res 1              ; 今この瞬間、**自分の体が**操作キ
         jmp ai_try_attack
 @done:
         rts
+
+.if ::DBG_ENABLE
+; 門の中身（素通りしなかったときだけ通る）。A = dbg_ally, X = 自分。
+dbg_ally_gate:
+        cpx #ENT_ENEMY_FIRST
+        bcs dbg_resume           ; **敵には一切効かせない。**効くのは仲間だけである
+        cmp #DBG_ALLY_REST
+        bne :+
+        jmp ai_dbg_rest_one      ; 2 = 休ませる（あちらが rts する）
+:       lda #DBG_ALLY_MUTE_HOLD  ; 1 = 攻撃しない。振るまでの間隔を毎フレーム積み直す
+        sta ai_timer, x          ;     （考え・歩き・追従・揺らぎはこの後そのまま走る）
+        jmp dbg_resume
+.endif
 .endproc
 
 ; X = エンティティ番号（ai_prof 済み）。時間の経過。動けない状態でも進める。
@@ -1108,6 +1189,11 @@ ai_urgent:  .res 1              ; 今この瞬間、**自分の体が**操作キ
         jsr ai_clear_player_zone ; **操作キャラの前に立たない**（最優先）
         jsr ai_avoid_allies      ; 押し出しで潰れた分散を取り戻す（仲間どうしが団子にならない）
 
+; 「決めた立ち位置（ai_t0/ai_t1）へ歩く」だけの入口。既定の経路はここを素通りする
+; （ラベルが1つ増えるだけで、命令は1つも増えていない）。
+; 借り手は休ませるモード（ai_dbg_rest_one）である。あちらは標的も目標も持たないので
+; 立ち位置の計算（上）には入れない。ここから下は ai_target を見ていないので借りられる。
+walk_to_post:
         lda ai_t0                ; 差 = 立ち位置 - 自分（符号つき16bit）
         sec
         sbc ent_x_lo, x
@@ -1170,6 +1256,34 @@ ai_urgent:  .res 1              ; 今この瞬間、**自分の体が**操作キ
 @done:
         rts
 .endproc
+
+.if ::DBG_ENABLE
+; ==========================================================================
+; 休ませる（dbg_ally = 2）—— **仕様ではない。手触りを見るための仕掛けである**
+; ==========================================================================
+; X = 仲間。思考も移動も攻撃もしない。目標・タイマ・揺らぎの状態には**一切触らない**
+; （凍らせたまま持ち越すので、0 に戻した瞬間から続きとして動き出す）。
+;
+; 唯一残すのが**操作キャラに押されて退く**ことである。止めると、操作キャラが
+; 休んでいる仲間に乗り上げたまま抜けられなくなる＝ai-dev の最優先の不具合そのものになる。
+; 立ち位置を「いま自分が立っている所」に置いてから ai_clear_player_zone に通すので、
+; 専有距離の外に居るあいだは立ち位置＝現在地であり、1ドットも動かない。
+.proc ai_dbg_rest_one
+        lda act_hitstop, x
+        bne @done                ; ヒットストップ中は当人の時間が止まっている
+        lda ent_state, x
+        bne @done                ; ACT_ST_IDLE 以外は action 側が時間を進めている最中
+        jsr ai_load_profile      ; 退く足の速さ（ai_step_px）に要る。表を引くだけで考えてはいない
+        lda ent_x_lo, x          ; 立ち位置 = いま立っている所（＝動かない）
+        sta ai_t0
+        lda ent_x_hi, x
+        sta ai_t1
+        jsr ai_clear_player_zone ; 専有距離の中に居るときだけ、その外へ立ち位置がずれる
+        jmp ai_move_to_post::walk_to_post   ; 「立ち位置へ歩く」所だけを借りる（あちらの注記）
+@done:
+        rts
+.endproc
+.endif
 
 ; X = エンティティ番号。今フレームに進めるドット数を ai_px に入れる。
 ; 速さは 1/16 ドット単位で刻む（端数は ai_sub に持ち越す）。ai_prof が要る。
