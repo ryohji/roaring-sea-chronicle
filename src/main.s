@@ -1,8 +1,12 @@
 ; main.s — リセットハンドラとメインループ。
 .include "constants.inc"
 .include "zeropage.inc"
+.include "debug.inc"
 
 .export reset_handler
+.if ::DBG_ENABLE
+.export dbg_slow, dbg_ally      ; 読むのは ai-dev（dbg_ally）。engine は回すだけ
+.endif
 .import init_system, read_pad
 .import ent_clear_all, ent_activate
 .import ent_x_lo, ent_x_hi, ent_y
@@ -85,7 +89,25 @@ TEST_ENEMY_COUNT = 3
 .proc main_loop
 @frame:
         jsr wait_nmi
+.if ::DBG_ENABLE
+        ; --- スローの門（デバッグ。既定 dbg_slow = 0 では素通りする）---
+        ; ここが NMI の直後・read_pad の**手前**にあることが肝である。
+        ; 飛ばすフレームで read_pad を呼ぶと、そのフレームで pad_pressed
+        ;（押した瞬間）が立って誰にも読まれずに消え、攻撃の入力が落ちる。
+        ; 飛ばすのは論理更新まるごとであって、NMI ではない（DMA・転送・
+        ; スクロールは等速のまま走り続けるので、画面は止まらない）。
+        lda dbg_skip
+        beq @logic
+        dec dbg_skip
+        jmp @frame
+@logic:
+        lda dbg_slow            ; この論理フレームのぶんを積み直す
+        sta dbg_skip
+.endif
         jsr read_pad
+.if ::DBG_ENABLE
+        jsr dbg_buttons         ; START / SELECT でモードを回す（入力を読んだ直後）
+.endif
         jsr fx_update           ; 短命の効果の寿命。**action / ai が出す前に**減らす
         jsr action_update       ; 操作・攻撃・ダウンは src/action/ が持つ
         jsr ai_update           ; 自律仲間と敵の思考・行動は src/ai/ が持つ
@@ -93,6 +115,48 @@ TEST_ENEMY_COUNT = 3
         jsr oam_build
         jmp @frame
 .endproc
+
+.if ::DBG_ENABLE
+; --- デバッグのモード切り替え ---
+; **押した瞬間**（pad_pressed）だけで回す。押しっぱなしで走らせない。
+; ここは論理フレームでしか呼ばれないので、飛ばしているフレームの入力は見ない。
+.proc dbg_buttons
+        lda pad_pressed
+        and #PAD_START
+        beq @select
+        lda dbg_slow
+        jsr dbg_bump
+        sta dbg_slow
+        sta dbg_skip            ; 押した瞬間から新しい速さで刻む
+@select:
+        lda pad_pressed
+        and #PAD_SELECT
+        beq @done
+        lda dbg_ally            ; 意味を解釈するのは src/ai/。ここは値を回すだけ
+        jsr dbg_bump
+        sta dbg_ally
+@done:
+        rts
+.endproc
+
+; A = いまの値 → A = 次の値（0 → 1 → 2 → 0）
+.proc dbg_bump
+        clc
+        adc #1
+        cmp #DBG_MODE_COUNT
+        bcc :+
+        lda #0
+:       rts
+.endproc
+
+.segment "BSS"
+; 実体はここ（BSS）。ゼロページは使わない（理由は src/debug.inc）。
+dbg_slow:   .res 1              ; 論理更新1回につき飛ばすフレーム数（0 = 等速）
+dbg_ally:   .res 1              ; 仲間の確認モード（読むのは src/ai/）
+dbg_skip:   .res 1              ; 残りの飛ばすフレーム数（engine 内部。公開しない）
+
+.segment "CODE"
+.endif
 
 ; NMI が来るまで待つ。1フレーム1回だけ呼ぶこと。
 .proc wait_nmi
