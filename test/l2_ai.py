@@ -22,8 +22,9 @@ sys.path.insert(0, os.path.join(HERE, "harness"))
 from cpu6502 import CpuCrash                        # noqa: E402
 from nes import Nes, boot, frame_end, step_frame    # noqa: E402
 from scene import disarm_enemies, slot_ranges       # noqa: E402
-from gate import Gate, run_sections, boot_or_fail   # noqa: E402
-from srcdefs import action_defs, ai_defs            # noqa: E402
+from gate import Gate, run_sections, boot_or_fail, skip_sections   # noqa: E402
+from srcdefs import action_defs, ai_defs, defs      # noqa: E402
+import dbgmode                                      # noqa: E402
 
 TSV_PATH = os.path.join(os.path.dirname(HERE), "data", "ai_params.tsv")
 
@@ -231,6 +232,20 @@ def layer2_ai(rom_path, labels, r):
                     "上のパラメータ表の失敗を先に直すこと")
         return
     run_sections(gate, sections, lambda fn: (rom_path, labels, profiles, r))
+
+    # 手触り確認のためのデバッグ機構（src/debug.inc の dbg_ally）を見る節。
+    # **仕様ではない。**DBG_ENABLE = 0 でコードごと消えるので、そのときは
+    # 落とさずに飛ばす（無いものは壊れようがない）。飛ばしたことは SKIP として出る。
+    dbg_sections = (
+        ("休ませた仲間は敵の標的にならない",
+         ("dbg_ally", "ai_target", "ai_update"), _check_rest_not_targeted),
+        ("休ませても壁にならない",
+         ("dbg_ally", "ai_goal"), _check_rest_not_a_wall),
+    )
+    if dbgmode.enabled():
+        run_sections(gate, dbg_sections, lambda fn: (rom_path, labels, profiles, r))
+    else:
+        skip_sections(r, dbg_sections, dbgmode.SKIP_WHY)
 
 
 # ---------------------------------------------------------------- パラメータ表
@@ -1031,3 +1046,198 @@ def _check_hate(rom_path, labels, profiles, r):
                 "**実際より近くに居るものとして**測られる（攻撃性 aggr_x=%d と同じ物差し）。"
                 "ここが効かないと、P2 で庇護型に狙いを集める設計が列を埋めても動かない"
                 % ("／".join(swings), mid, aggr))
+
+
+# ================================================================ 仲間の確認モード
+# src/debug.inc の dbg_ally（SELECT で 0 → 1 → 2 → 0）。**仕様ではない。**
+# 主が「1対1の間合い」を見るための仕掛けで、DBG_ENABLE = 0 でコードごと消える。
+#
+#   1 = 攻撃しない ／ 2 = 休ませる（思考も移動もしない＋**敵の標的選択から外れる**）
+#
+# ここで見るのは、その 2（休ませる）が**主の求めるものになっているか**である。
+#   * 敵が休んでいる仲間に張りつくと、結局1対1の間合いは見られない（実質1対3のまま）。
+#   * だからといって仲間を完全に凍らせると、操作キャラが乗り上げたまま抜けられない
+#     ＝ai-dev の最優先の不具合「自律仲間が壁になって進行不能にする」そのものになる。
+# この2つは互いに引っぱり合うので、両方を**同時に**見張る。
+#
+# **モードは変数に直接書かず、実際に SELECT を押して入る**（test/dbgmode.py）。
+# 押下を数フレーム保つのは、モードの切り替えが論理フレームでしか読まれないからである。
+
+# dbg_ally の値の意味は src/ai/ai.s が正本（engine は値を回すだけで解釈しない）。
+# テストに 2 と書かずにそこから読む。
+AI_DBG = defs("src/ai/ai.s", "src/ai/ai_params.inc", "src/ai/ai.inc", "src/constants.inc")
+
+# 標的の観測フレーム数。敵は数十フレームおきに考え直すので、
+# 「たまたま狙われなかった」では済まない長さを取る。
+REST_TARGET_FRAMES = 400
+# 対照（通常モードで仲間が狙われること）の観測フレーム数。こちらは短くてよい。
+# 「一度も無い」を示すには長い窓が要るが、「ある」を示すには最初の1回で足りる。
+# 実測では敵は**観測の初回フレームから**仲間を標的にしている。
+# ここを縮めたのは回帰テストの実行時間のためである（CI が遅いと誰も回さなくなる）。
+# 主張そのもの（上の 400 フレーム）は縮めていない。
+REST_CONTROL_FRAMES = 120
+
+
+def _rest_mode():
+    return AI_DBG["DBG_ALLY_REST"]
+
+
+def _watch_enemy_targets(rom_path, labels, want_mode, frames):
+    """dbg_ally = want_mode にして frames 進め、敵が誰を狙ったかを数える。
+
+    戻り値: (実際に入れたモード, {標的の番号: 観測フレーム数}, 仲間が生存していたフレーム数)
+    """
+    s = Scene(rom_path, labels)
+    mode = dbgmode.to_mode(s, "SELECT", "dbg_ally", want_mode)
+    slots = s.slots
+    allies = range(slots["ally_first"], slots["enemy_first"])
+    seen = {}
+    ally_alive = 0
+    enemy_seen = 0
+    s.nes.set_buttons(set())
+    for _ in range(frames):
+        step_frame(s.nes, s.labels, 1)
+        if any(s.alive(i) for i in allies):
+            ally_alive += 1
+        for e in range(slots["enemy_first"], slots["count"]):
+            if not s.get("ent_active", e):
+                continue
+            enemy_seen += 1
+            t = s.get("ai_target", e)
+            seen[t] = seen.get(t, 0) + 1
+    return mode, seen, ally_alive, enemy_seen
+
+
+def _check_rest_not_targeted(rom_path, labels, profiles, r):
+    """休ませた仲間（dbg_ally = 2）が敵の標的に**一度も**現れないこと。"""
+    r.section("休ませた仲間は敵の標的にならない（dbg_ally = 2）")
+
+    slots = slot_ranges(labels)
+    allies = list(range(slots["ally_first"], slots["enemy_first"]))
+    rest = _rest_mode()
+
+    # --- 0. ボタンでモードが巡回するか（結線の検査）---
+    wiring = Scene(rom_path, labels)
+    seq = dbgmode.cycle(wiring, "SELECT", "dbg_ally", dbgmode.mode_count())
+    want_seq = list(range(1, dbgmode.mode_count())) + [0]
+    r.check("SELECT を押すと dbg_ally が %s と巡回する（モードに変数で入らない）"
+            % " → ".join(str(v) for v in [0] + want_seq), seq == want_seq,
+            "SELECT を %d 回押したときの dbg_ally が %s（期待 %s）。"
+            "src/main.s の dbg_buttons が PAD_SELECT を読めていないか、dbg_bump の巡回が "
+            "DBG_MODE_COUNT と合っていない。**ここが落ちている間、下の主張は"
+            "「モードに入れていないまま通った」可能性がある**"
+            % (dbgmode.mode_count(), seq, want_seq))
+
+    # --- 1. 対照（dbg_ally = 0 では仲間が実際に狙われる）---
+    # これが無いと、下の「狙われない」は**仲間が端から狙われる立場に無い**だけでも通る。
+    off_mode, off_seen, off_alive, off_enemies = _watch_enemy_targets(
+        rom_path, labels, 0, REST_CONTROL_FRAMES)
+    off_hits = sum(off_seen.get(i, 0) for i in allies)
+    r.check("対照: 通常（dbg_ally = 0）では敵が仲間を標的にする（比較が空振りでない）",
+            off_mode == 0 and off_hits > 0 and off_enemies > 0,
+            "dbg_ally=%d、仲間(#%s)を狙っていたのは %d フレーム、敵の観測はのべ %d 体フレーム "
+            "（標的の内訳 %s / %d フレーム中）。通常モードで一度も仲間が狙われないなら、"
+            "下の「休ませると狙われない」は何も確かめていない。敵が全滅しているか、"
+            "ヘイト（ai_p_hate）が仲間を候補から外している"
+            % (off_mode, allies, off_hits, off_enemies, sorted(off_seen.items()),
+               REST_CONTROL_FRAMES))
+
+    # --- 2. 主張（dbg_ally = 2 では一度も狙われない）---
+    mode, seen, alive, enemies = _watch_enemy_targets(
+        rom_path, labels, rest, REST_TARGET_FRAMES)
+    hits = sum(seen.get(i, 0) for i in allies)
+    r.check("休ませた仲間(#%s)が %d フレームのあいだ敵の ai_target に一度も現れない"
+            % (allies, REST_TARGET_FRAMES),
+            mode == rest and hits == 0,
+            "dbg_ally=%d（期待 %d）で、仲間が標的になっていたのが %d フレーム"
+            "（標的の内訳 %s）。休ませた仲間に敵が張りつくと、**主の求める"
+            "「1対1の間合い」が見られない**（実質1対3のまま）。ai.s の ai_pick_target が "
+            "dbg_ally = %d のときに走査の終端を ENT_ALLY_FIRST まで縮めていない"
+            % (mode, rest, hits, sorted(seen.items()), rest))
+
+    # 空振り防止: 仲間が生きていて、敵も居た窓であること。
+    # 仲間が早々に倒れていたのなら「狙われない」は当たり前で、何も確かめていない。
+    r.check("その窓で仲間が生存し、敵も動いていた（観測が空振りでない）",
+            alive >= REST_TARGET_FRAMES // 2 and enemies > 0,
+            "仲間の生存 %d フレーム（%d 中、期待は半分以上）、敵の観測のべ %d 体フレーム。"
+            "仲間が倒れていれば標的から外れるのは当然で、dbg_ally の門が効いているかは"
+            "分からない。休ませた仲間は攻撃されないはずなので、ここが減るのは"
+            "「休ませているのに殴られている」疑い"
+            % (alive, REST_TARGET_FRAMES, enemies))
+
+
+# 壁の検証のフレーム数。
+REST_STILL_FRAMES = 60      # 休んでいる仲間が自分からは動かないことを見る
+REST_PIN_FRAMES = 90        # 操作キャラをワールド左端まで押し込む
+REST_WALL_FRAMES = 150      # 乗り上げてから退くまでを見る
+
+
+def _check_rest_not_a_wall(rom_path, labels, profiles, r):
+    """休ませていても（dbg_ally = 2）操作キャラの壁にならないこと。
+
+    休ませる門は「思考も移動もしない」だが、**操作キャラに押されて退くことだけは残る**
+    （ai.s の ai_dbg_rest_one → ai_clear_player_zone）。ここを止めると、操作キャラが
+    休んでいる仲間に乗り上げたまま抜けられなくなる＝進行不能そのものである。
+
+    いちばん厳しいのは**ワールド左端に押し込んだ**ときである。操作キャラはそれ以上
+    左へ逃げられないので、退くのは仲間の側しかない。
+    """
+    r.section("休ませても壁にならない（dbg_ally = 2）")
+
+    slots = slot_ranges(labels)
+    player, ally = slots["player"], slots["ally_first"]
+    rest = _rest_mode()
+
+    s = Scene(rom_path, labels)
+    disarm_enemies(s.nes, labels)      # 見たいのは押し合いであって戦闘ではない
+    mode = dbgmode.to_mode(s, "SELECT", "dbg_ally", rest)
+
+    # --- 0. 休ませる門が本当に効いているか（空振り防止）---
+    # 効いていなければ、以下は「いつもの追従」を見ているだけで dbg_ally を検証していない。
+    before = (s.x(ally), s.y(ally))
+    s.trace(REST_STILL_FRAMES, lambda _s: None)
+    after = (s.x(ally), s.y(ally))
+    r.check("休ませた仲間は、離れて立っているあいだ1ドットも動かない（門が効いている）",
+            mode == rest and after == before,
+            "dbg_ally=%d（期待 %d）で、仲間が (%d,%d) から (%d,%d) へ動いた。"
+            "**ここが動いている間、下の「退く」は普段の追従を見ているだけである。**"
+            "ai.s の ai_act_one の門が dbg_ally を読めていないか、ai_dbg_rest_one が"
+            "立ち位置を現在地に置いていない（置かないと、休ませても元の立ち位置へ歩き出す）"
+            % (mode, rest, before[0], before[1], after[0], after[1]))
+
+    # --- 1. 操作キャラをワールド左端へ押し込む ---
+    xs = s.trace(REST_PIN_FRAMES, lambda t: t.x(player), buttons={"LEFT"})
+    pinned = len(set(xs[-10:])) == 1
+    r.check("操作キャラがワールド左端に達してそれ以上左へ行けない（最悪の場を作れた）",
+            pinned,
+            "直前 10 フレームの x が %s。左端に貼り付いていないなら、"
+            "操作キャラは単に仲間から歩き去れる＝**退く側が居なくても重なりは解ける**ので、"
+            "下の検証は最悪の場を見ていない" % xs[-10:])
+
+    # --- 2. その真上に休んでいる仲間を置き、押し続ける ---
+    # 乗り上げた瞬間を作るための配置である（休んでいる仲間は自分から寄ってこないので、
+    # 「操作キャラが歩いて乗り上げた」状態をここで作る）。
+    s.set_x(ally, s.x(player))
+    s.put("ent_y", ally, s.y(player))
+
+    def watch(t):
+        both = t.alive(player) and t.alive(ally)
+        return (both, t.near_depth(player, ally), abs(t.x(player) - t.x(ally)))
+
+    samples = s.trace(REST_WALL_FRAMES, watch, buttons={"LEFT"})
+    overlap = [(both and same and d < OVERLAP_X) for both, same, d in samples]
+    longest, total = _runs_of(overlap)
+
+    r.check("乗り上げた状態を実際に観測できた（重なりが1フレーム以上ある）", total >= 1,
+            "重なり (|x差| < %d かつ足元Yの差 < %d) が %d フレーム中1度も無かった。"
+            "配置した直後に離れているなら、この節は「退く」を一度も見ていない"
+            % (OVERLAP_X, DEPTH_OVERLAP_Y, REST_WALL_FRAMES))
+    r.check("休ませた仲間に乗り上げても、重なり (|x差| < %d) が %d フレーム以上続かない"
+            % (OVERLAP_X, OVERLAP_FRAMES_MAX + 1), longest <= OVERLAP_FRAMES_MAX,
+            "重なりが最長 %d フレーム続いた（合計 %d フレーム / %d 中）。"
+            "休ませた仲間が**壁になっている**。操作キャラは左端で逃げ場が無いので、"
+            "退けるのは仲間の側だけである。ai.s の ai_dbg_rest_one から "
+            "ai_clear_player_zone（専有距離の外へ立ち位置を押し出す）への経路が"
+            "切れている疑いが濃い。「休ませる = 完全に凍らせる」にすると必ずこうなる。"
+            "凍らせてよいのは**思考と攻撃**までで、押されて退く足は残すこと"
+            % (longest, total, REST_WALL_FRAMES))
